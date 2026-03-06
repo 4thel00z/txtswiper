@@ -3,6 +3,8 @@ const c = @cImport({
     @cInclude("stb_image.h");
 });
 
+pub const activations = @import("activations.zig");
+
 /// Load an image from a file path. Returns pixel data and image dimensions.
 /// Caller owns the returned pixel slice and must free it with `stbiFree`.
 pub fn loadImage(path: [*:0]const u8) !struct { data: [*]u8, width: c_int, height: c_int, channels: c_int } {
@@ -29,4 +31,8 @@ test "stb_image linked" {
     var ch: c_int = 0;
     const result = c.stbi_load("__nonexistent__.png", &w, &h, &ch, 0);
     try std.testing.expect(result == null);
+}
+
+test {
+    _ = activations;
 }
