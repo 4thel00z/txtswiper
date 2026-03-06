@@ -437,6 +437,128 @@ pub const LSTMLayer = struct {
     }
 };
 
+// ── ConvolveLayer ────────────────────────────────────────────────────────────
+//
+// A Convolve layer stacks spatial neighborhood features. It creates a sliding
+// window of size (2*half_x + 1) along the width axis and stacks all the input
+// features from each position in the window.
+//
+// Output features = ni * (2 * half_x + 1).
+
+pub const ConvolveLayer = struct {
+    ni: usize, // input features per position
+    no: usize, // output features = ni * (2*half_x + 1)
+    half_x: usize, // half window size (e.g., half_x=1 means window of 3)
+
+    /// Create a ConvolveLayer with `ni` input features and half-window `half_x`.
+    pub fn init(ni: usize, half_x: usize) ConvolveLayer {
+        return ConvolveLayer{
+            .ni = ni,
+            .no = ni * (2 * half_x + 1),
+            .half_x = half_x,
+        };
+    }
+
+    /// Forward pass: for each timestep, stack features from the surrounding window.
+    /// Positions outside the input boundary are zero-padded.
+    pub fn forward(self: *const ConvolveLayer, input: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) !void {
+        _ = allocator;
+        const w = input.width();
+        try output.resize(w, self.no);
+
+        const half = self.half_x;
+        const ni = self.ni;
+
+        for (0..w) |t| {
+            var out_offset: usize = 0;
+            const out_buf = output.f_data.?;
+
+            // dx ranges from -half_x to +half_x inclusive
+            var dx: usize = 0;
+            const window_size = 2 * half + 1;
+            while (dx < window_size) : (dx += 1) {
+                // src_t = t + dx - half (avoiding underflow with checked arithmetic)
+                const shifted = t + dx;
+                if (shifted >= half and shifted - half < w) {
+                    const src_t = shifted - half;
+                    // Copy ni features from input at src_t
+                    const in_buf = input.f_data.?;
+                    const src_offset = src_t * input.num_features_;
+                    const dst_offset = t * self.no + out_offset;
+                    @memcpy(
+                        out_buf[dst_offset .. dst_offset + ni],
+                        in_buf[src_offset .. src_offset + ni],
+                    );
+                } else {
+                    // Out of bounds: fill with zeros
+                    const dst_offset = t * self.no + out_offset;
+                    @memset(out_buf[dst_offset .. dst_offset + ni], 0.0);
+                }
+                out_offset += ni;
+            }
+        }
+    }
+};
+
+// ── MaxpoolLayer ─────────────────────────────────────────────────────────────
+//
+// Downsamples the width dimension by taking the element-wise maximum over a
+// window. The feature count is preserved.
+
+pub const MaxpoolLayer = struct {
+    ni: usize, // input features = output features
+    no: usize, // same as ni (maxpool doesn't change feature count)
+    x_scale: usize, // downsampling factor along width
+
+    /// Create a MaxpoolLayer with `ni` features and downsampling factor `x_scale`.
+    pub fn init(ni: usize, x_scale: usize) MaxpoolLayer {
+        return MaxpoolLayer{
+            .ni = ni,
+            .no = ni,
+            .x_scale = x_scale,
+        };
+    }
+
+    /// Forward pass: downsample width by taking element-wise max over each window.
+    pub fn forward(self: *const MaxpoolLayer, input: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) !void {
+        _ = allocator;
+        const in_w = input.width();
+        const out_w = (in_w + self.x_scale - 1) / self.x_scale; // ceil division
+        try output.resize(out_w, self.no);
+
+        const out_buf = output.f_data.?;
+        const in_buf = input.f_data.?;
+        const nf = self.no;
+
+        for (0..out_w) |out_t| {
+            const src_start = out_t * self.x_scale;
+            const dst_offset = out_t * nf;
+            const src_offset = src_start * input.num_features_;
+
+            // Initialize with first position in pool window
+            @memcpy(
+                out_buf[dst_offset .. dst_offset + nf],
+                in_buf[src_offset .. src_offset + nf],
+            );
+
+            // Take element-wise max over the rest of the pool window
+            var dx: usize = 1;
+            while (dx < self.x_scale) : (dx += 1) {
+                const src_t = src_start + dx;
+                if (src_t < in_w) {
+                    const src_off = src_t * input.num_features_;
+                    for (0..nf) |f_idx| {
+                        out_buf[dst_offset + f_idx] = @max(
+                            out_buf[dst_offset + f_idx],
+                            in_buf[src_off + f_idx],
+                        );
+                    }
+                }
+            }
+        }
+    }
+};
+
 // ── Layer Union ──────────────────────────────────────────────────────────────
 //
 // A tagged union that can hold any layer type. This allows SeriesLayer and
@@ -453,6 +575,8 @@ pub const Layer = union(enum) {
     lstm: LSTMLayer,
     series: *SeriesLayer,
     parallel: *ParallelLayer,
+    convolve: ConvolveLayer,
+    maxpool: MaxpoolLayer,
 
     /// Dispatch forward to the underlying layer.
     pub fn forward(self: *Layer, input: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) ForwardError!void {
@@ -461,6 +585,8 @@ pub const Layer = union(enum) {
             .lstm => |*l| try l.forward(input, output, allocator),
             .series => |s| try s.forward(input, output, allocator),
             .parallel => |p| try p.forward(input, output, allocator),
+            .convolve => |*c| try c.forward(input, output, allocator),
+            .maxpool => |*m| try m.forward(input, output, allocator),
         }
     }
 
@@ -471,6 +597,8 @@ pub const Layer = union(enum) {
             .lstm => |l| l.ns,
             .series => |s| s.no,
             .parallel => |p| p.no,
+            .convolve => |c| c.no,
+            .maxpool => |m| m.no,
         };
     }
 };
@@ -499,6 +627,8 @@ pub const SeriesLayer = struct {
             .lstm => |l| l.ni,
             .series => |s| s.ni,
             .parallel => |p| p.ni,
+            .convolve => |c| c.ni,
+            .maxpool => |m| m.ni,
         } else 0;
 
         const no: usize = if (layers.len > 0) layers[layers.len - 1].numOutputs() else 0;
@@ -597,6 +727,8 @@ pub const ParallelLayer = struct {
             .lstm => |l| l.ni,
             .series => |s| s.ni,
             .parallel => |p| p.ni,
+            .convolve => |c| c.ni,
+            .maxpool => |m| m.ni,
         } else 0;
 
         var no: usize = 0;
@@ -1371,4 +1503,241 @@ test "Layer union dispatches correctly" {
 
     // Verify numOutputs dispatch
     try std.testing.expectEqual(@as(usize, 1), layer.numOutputs());
+}
+
+// ── ConvolveLayer / MaxpoolLayer Tests ───────────────────────────────────────
+
+test "ConvolveLayer stacks neighbors" {
+    const allocator = std.testing.allocator;
+
+    // ni=2, half_x=1 (window of 3) -> no=6
+    const conv = ConvolveLayer.init(2, 1);
+    try std.testing.expectEqual(@as(usize, 6), conv.no);
+
+    // Input: width=4, features=2
+    //   t=0: [1, 2], t=1: [3, 4], t=2: [5, 6], t=3: [7, 8]
+    var input = try NetworkIO.init(allocator, 4, 2, false);
+    defer input.deinit();
+    input.writeTimeStep(0, &[_]f32{ 1.0, 2.0 });
+    input.writeTimeStep(1, &[_]f32{ 3.0, 4.0 });
+    input.writeTimeStep(2, &[_]f32{ 5.0, 6.0 });
+    input.writeTimeStep(3, &[_]f32{ 7.0, 8.0 });
+
+    var output = try NetworkIO.init(allocator, 1, 1, false);
+    defer output.deinit();
+
+    try conv.forward(&input, &output, allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), output.width());
+    try std.testing.expectEqual(@as(usize, 6), output.numFeatures());
+
+    const tol: f32 = 1e-6;
+
+    // Output at t=0: [0,0, 1,2, 3,4] (left padded with zeros)
+    var out0: [6]f32 = undefined;
+    output.readTimeStep(0, &out0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out0[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out0[1], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out0[2], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), out0[3], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), out0[4], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), out0[5], tol);
+
+    // Output at t=1: [1,2, 3,4, 5,6] (t0, t1, t2 stacked)
+    var out1: [6]f32 = undefined;
+    output.readTimeStep(1, &out1);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out1[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), out1[1], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), out1[2], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), out1[3], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), out1[4], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), out1[5], tol);
+
+    // Output at t=3: [5,6, 7,8, 0,0] (right padded with zeros)
+    var out3: [6]f32 = undefined;
+    output.readTimeStep(3, &out3);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), out3[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), out3[1], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), out3[2], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0), out3[3], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out3[4], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out3[5], tol);
+}
+
+test "ConvolveLayer no padding center" {
+    const allocator = std.testing.allocator;
+
+    // ni=3, half_x=1 (window of 3) -> no=9
+    const conv = ConvolveLayer.init(3, 1);
+    try std.testing.expectEqual(@as(usize, 9), conv.no);
+
+    // Input: width=5, features=3
+    var input = try NetworkIO.init(allocator, 5, 3, false);
+    defer input.deinit();
+    input.writeTimeStep(0, &[_]f32{ 1.0, 2.0, 3.0 });
+    input.writeTimeStep(1, &[_]f32{ 4.0, 5.0, 6.0 });
+    input.writeTimeStep(2, &[_]f32{ 7.0, 8.0, 9.0 });
+    input.writeTimeStep(3, &[_]f32{ 10.0, 11.0, 12.0 });
+    input.writeTimeStep(4, &[_]f32{ 13.0, 14.0, 15.0 });
+
+    var output = try NetworkIO.init(allocator, 1, 1, false);
+    defer output.deinit();
+
+    try conv.forward(&input, &output, allocator);
+
+    const tol: f32 = 1e-6;
+
+    // Center positions (t=1, t=2, t=3) should have no zeros -- all from valid input
+    // t=2: [t1, t2, t3] = [4,5,6, 7,8,9, 10,11,12]
+    var out2: [9]f32 = undefined;
+    output.readTimeStep(2, &out2);
+    for (out2) |v| {
+        try std.testing.expect(v != 0.0);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), out2[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), out2[1], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), out2[2], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), out2[3], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0), out2[4], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 9.0), out2[5], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), out2[6], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 11.0), out2[7], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 12.0), out2[8], tol);
+
+    // t=1 and t=3 also should have all nonzero values (they're center enough)
+    var out1: [9]f32 = undefined;
+    output.readTimeStep(1, &out1);
+    for (out1) |v| {
+        try std.testing.expect(v != 0.0);
+    }
+
+    var out3: [9]f32 = undefined;
+    output.readTimeStep(3, &out3);
+    for (out3) |v| {
+        try std.testing.expect(v != 0.0);
+    }
+}
+
+test "MaxpoolLayer downsamples" {
+    const allocator = std.testing.allocator;
+
+    // ni=2, x_scale=2
+    const mp = MaxpoolLayer.init(2, 2);
+    try std.testing.expectEqual(@as(usize, 2), mp.no);
+
+    // Input: width=4, features=2
+    //   t=0: [1, 4], t=1: [3, 2], t=2: [5, 8], t=3: [7, 6]
+    var input = try NetworkIO.init(allocator, 4, 2, false);
+    defer input.deinit();
+    input.writeTimeStep(0, &[_]f32{ 1.0, 4.0 });
+    input.writeTimeStep(1, &[_]f32{ 3.0, 2.0 });
+    input.writeTimeStep(2, &[_]f32{ 5.0, 8.0 });
+    input.writeTimeStep(3, &[_]f32{ 7.0, 6.0 });
+
+    var output = try NetworkIO.init(allocator, 1, 1, false);
+    defer output.deinit();
+
+    try mp.forward(&input, &output, allocator);
+
+    // Output: width=2
+    try std.testing.expectEqual(@as(usize, 2), output.width());
+    try std.testing.expectEqual(@as(usize, 2), output.numFeatures());
+
+    const tol: f32 = 1e-6;
+
+    // out_t=0: max([1,4], [3,2]) = [3, 4]
+    var out0: [2]f32 = undefined;
+    output.readTimeStep(0, &out0);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), out0[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), out0[1], tol);
+
+    // out_t=1: max([5,8], [7,6]) = [7, 8]
+    var out1: [2]f32 = undefined;
+    output.readTimeStep(1, &out1);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), out1[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0), out1[1], tol);
+}
+
+test "MaxpoolLayer odd width" {
+    const allocator = std.testing.allocator;
+
+    // ni=2, x_scale=2
+    const mp = MaxpoolLayer.init(2, 2);
+
+    // Input: width=5, features=2
+    //   t=0: [1, 2], t=1: [3, 4], t=2: [5, 6], t=3: [7, 8], t=4: [9, 10]
+    var input = try NetworkIO.init(allocator, 5, 2, false);
+    defer input.deinit();
+    input.writeTimeStep(0, &[_]f32{ 1.0, 2.0 });
+    input.writeTimeStep(1, &[_]f32{ 3.0, 4.0 });
+    input.writeTimeStep(2, &[_]f32{ 5.0, 6.0 });
+    input.writeTimeStep(3, &[_]f32{ 7.0, 8.0 });
+    input.writeTimeStep(4, &[_]f32{ 9.0, 10.0 });
+
+    var output = try NetworkIO.init(allocator, 1, 1, false);
+    defer output.deinit();
+
+    try mp.forward(&input, &output, allocator);
+
+    // Output: width = ceil(5/2) = 3
+    try std.testing.expectEqual(@as(usize, 3), output.width());
+    try std.testing.expectEqual(@as(usize, 2), output.numFeatures());
+
+    const tol: f32 = 1e-6;
+
+    // out_t=0: max([1,2], [3,4]) = [3, 4]
+    var out0: [2]f32 = undefined;
+    output.readTimeStep(0, &out0);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), out0[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), out0[1], tol);
+
+    // out_t=1: max([5,6], [7,8]) = [7, 8]
+    var out1: [2]f32 = undefined;
+    output.readTimeStep(1, &out1);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), out1[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0), out1[1], tol);
+
+    // out_t=2: only t=4 in window -> [9, 10]
+    var out2: [2]f32 = undefined;
+    output.readTimeStep(2, &out2);
+    try std.testing.expectApproxEqAbs(@as(f32, 9.0), out2[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), out2[1], tol);
+}
+
+test "Convolve in Layer union dispatches" {
+    const allocator = std.testing.allocator;
+
+    // Wrap ConvolveLayer in Layer, call forward, verify
+    const conv = ConvolveLayer.init(2, 1);
+    var layer = Layer{ .convolve = conv };
+
+    try std.testing.expectEqual(@as(usize, 6), layer.numOutputs());
+
+    // Input: width=3, features=2
+    //   t=0: [1, 2], t=1: [3, 4], t=2: [5, 6]
+    var input = try NetworkIO.init(allocator, 3, 2, false);
+    defer input.deinit();
+    input.writeTimeStep(0, &[_]f32{ 1.0, 2.0 });
+    input.writeTimeStep(1, &[_]f32{ 3.0, 4.0 });
+    input.writeTimeStep(2, &[_]f32{ 5.0, 6.0 });
+
+    var output = try NetworkIO.init(allocator, 1, 1, false);
+    defer output.deinit();
+
+    try layer.forward(&input, &output, allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), output.width());
+    try std.testing.expectEqual(@as(usize, 6), output.numFeatures());
+
+    const tol: f32 = 1e-6;
+
+    // t=1 (center): [1,2, 3,4, 5,6]
+    var out1: [6]f32 = undefined;
+    output.readTimeStep(1, &out1);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out1[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), out1[1], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), out1[2], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), out1[3], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), out1[4], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), out1[5], tol);
 }
