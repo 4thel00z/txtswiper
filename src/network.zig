@@ -559,6 +559,106 @@ pub const MaxpoolLayer = struct {
     }
 };
 
+// ── InputLayer ───────────────────────────────────────────────────────────────
+//
+// The Input layer is the first layer in a Tesseract network. It defines the
+// expected input dimensions (batch, height, width, depth) and simply passes
+// the input through unchanged.
+
+pub const InputLayer = struct {
+    ni: usize, // num inputs (= height or depth depending on shape)
+    no: usize, // num outputs (= depth)
+    batch: i32,
+    height: i32,
+    width: i32,
+    depth: i32,
+
+    /// Forward pass: pass-through (copies input to output).
+    pub fn forward(self: *const InputLayer, input: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) !void {
+        _ = allocator;
+        _ = self;
+        const w = input.width();
+        const nf = input.numFeatures();
+        try output.resize(w, nf);
+        for (0..w) |t| {
+            output.copyTimeStepFrom(t, input, t);
+        }
+    }
+};
+
+// ── ReversedLayer ────────────────────────────────────────────────────────────
+//
+// Wraps a single child layer. In the forward pass it reverses the input
+// timestep order, runs the child, then reverses the output back.
+// Variants: RTLReversed (x-reversed), TTBReversed (y-reversed), XYTranspose.
+// For inference, XYTranspose is a no-op on 1D data.
+
+pub const ReversedType = enum {
+    x_reversed, // RTLReversed: reverse along width (right-to-left)
+    y_reversed, // TTBReversed: reverse along height (top-to-bottom)
+    xy_transpose, // XYTranspose: swap x and y
+};
+
+pub const ReversedLayer = struct {
+    child: Layer,
+    reversed_type: ReversedType,
+    ni: usize,
+    no: usize,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, child: Layer, reversed_type: ReversedType) !*ReversedLayer {
+        const ni: usize = child.numInputs();
+        const no: usize = child.numOutputs();
+        const self = try allocator.create(ReversedLayer);
+        self.* = .{
+            .child = child,
+            .reversed_type = reversed_type,
+            .ni = ni,
+            .no = no,
+            .allocator = allocator,
+        };
+        return self;
+    }
+
+    /// Forward pass: reverse input, run child, reverse output.
+    /// For 1D inference, XYTranspose is treated as pass-through since
+    /// Tesseract 1D LSTM models don't actually use the transpose.
+    pub fn forward(self: *ReversedLayer, input: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) ForwardError!void {
+        if (self.reversed_type == .xy_transpose) {
+            // For 1D data, XYTranspose is a pass-through.
+            try self.child.forward(input, output, allocator);
+            return;
+        }
+
+        // Reverse the input timesteps
+        const w = input.width();
+        const nf = input.numFeatures();
+        var reversed_input = try NetworkIO.init(allocator, w, nf, false);
+        defer reversed_input.deinit();
+        for (0..w) |t| {
+            reversed_input.copyTimeStepFrom(w - 1 - t, input, t);
+        }
+
+        // Run child on reversed input
+        var child_output = try NetworkIO.init(allocator, 1, 1, false);
+        defer child_output.deinit();
+        try self.child.forward(&reversed_input, &child_output, allocator);
+
+        // Reverse the output back
+        const out_w = child_output.width();
+        const out_nf = child_output.numFeatures();
+        try output.resize(out_w, out_nf);
+        for (0..out_w) |t| {
+            output.copyTimeStepFrom(out_w - 1 - t, &child_output, t);
+        }
+    }
+
+    pub fn deinit(self: *ReversedLayer) void {
+        deinitLayer(self.allocator, &self.child);
+        self.allocator.destroy(self);
+    }
+};
+
 // ── Layer Union ──────────────────────────────────────────────────────────────
 //
 // A tagged union that can hold any layer type. This allows SeriesLayer and
@@ -577,16 +677,20 @@ pub const Layer = union(enum) {
     parallel: *ParallelLayer,
     convolve: ConvolveLayer,
     maxpool: MaxpoolLayer,
+    input: InputLayer,
+    reversed: *ReversedLayer,
 
     /// Dispatch forward to the underlying layer.
-    pub fn forward(self: *Layer, input: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) ForwardError!void {
+    pub fn forward(self: *Layer, input_nio: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) ForwardError!void {
         switch (self.*) {
-            .fully_connected => |*fc| try fc.forward(input, output, allocator),
-            .lstm => |*l| try l.forward(input, output, allocator),
-            .series => |s| try s.forward(input, output, allocator),
-            .parallel => |p| try p.forward(input, output, allocator),
-            .convolve => |*c| try c.forward(input, output, allocator),
-            .maxpool => |*m| try m.forward(input, output, allocator),
+            .fully_connected => |*fc| try fc.forward(input_nio, output, allocator),
+            .lstm => |*l| try l.forward(input_nio, output, allocator),
+            .series => |s| try s.forward(input_nio, output, allocator),
+            .parallel => |p| try p.forward(input_nio, output, allocator),
+            .convolve => |*c| try c.forward(input_nio, output, allocator),
+            .maxpool => |*m| try m.forward(input_nio, output, allocator),
+            .input => |*inp| try inp.forward(input_nio, output, allocator),
+            .reversed => |r| try r.forward(input_nio, output, allocator),
         }
     }
 
@@ -599,6 +703,22 @@ pub const Layer = union(enum) {
             .parallel => |p| p.no,
             .convolve => |c| c.no,
             .maxpool => |m| m.no,
+            .input => |inp| inp.no,
+            .reversed => |r| r.no,
+        };
+    }
+
+    /// Return the number of input features for this layer.
+    pub fn numInputs(self: Layer) usize {
+        return switch (self) {
+            .fully_connected => |fc| fc.ni,
+            .lstm => |l| l.ni,
+            .series => |s| s.ni,
+            .parallel => |p| p.ni,
+            .convolve => |c| c.ni,
+            .maxpool => |m| m.ni,
+            .input => |inp| inp.ni,
+            .reversed => |r| r.ni,
         };
     }
 };
@@ -622,15 +742,7 @@ pub const SeriesLayer = struct {
         const owned_layers = try allocator.alloc(Layer, layers.len);
         @memcpy(owned_layers, layers);
 
-        const ni: usize = if (layers.len > 0) switch (layers[0]) {
-            .fully_connected => |fc| fc.ni,
-            .lstm => |l| l.ni,
-            .series => |s| s.ni,
-            .parallel => |p| p.ni,
-            .convolve => |c| c.ni,
-            .maxpool => |m| m.ni,
-        } else 0;
-
+        const ni: usize = if (layers.len > 0) layers[0].numInputs() else 0;
         const no: usize = if (layers.len > 0) layers[layers.len - 1].numOutputs() else 0;
 
         const self = try allocator.create(SeriesLayer);
@@ -722,14 +834,7 @@ pub const ParallelLayer = struct {
         const owned_layers = try allocator.alloc(Layer, layers.len);
         @memcpy(owned_layers, layers);
 
-        const ni: usize = if (layers.len > 0) switch (layers[0]) {
-            .fully_connected => |fc| fc.ni,
-            .lstm => |l| l.ni,
-            .series => |s| s.ni,
-            .parallel => |p| p.ni,
-            .convolve => |c| c.ni,
-            .maxpool => |m| m.ni,
-        } else 0;
+        const ni: usize = if (layers.len > 0) layers[0].numInputs() else 0;
 
         var no: usize = 0;
         for (layers) |layer| {
@@ -794,6 +899,426 @@ pub const ParallelLayer = struct {
         }
     }
 };
+
+// ── Layer Lifecycle ──────────────────────────────────────────────────────────
+
+/// Recursively free all resources owned by a deserialized Layer graph.
+/// For layers created via deserialization, this properly cleans up heap-allocated
+/// children, weight matrices, and state buffers.
+pub fn deinitLayer(allocator: std.mem.Allocator, layer: *Layer) void {
+    switch (layer.*) {
+        .fully_connected => |*fc| fc.deinit(allocator),
+        .lstm => |*l| l.deinit(),
+        .series => |s| {
+            for (s.layers) |*child| {
+                deinitLayer(allocator, child);
+            }
+            s.deinit();
+        },
+        .parallel => |p| {
+            for (p.layers) |*child| {
+                deinitLayer(allocator, child);
+            }
+            p.deinit();
+        },
+        .reversed => |r| r.deinit(),
+        .convolve => {},
+        .maxpool => {},
+        .input => {},
+    }
+}
+
+// ── Network Deserialization ─────────────────────────────────────────────────
+//
+// Deserializes a complete Tesseract network graph from the TESSDATA_LSTM binary
+// component. The format consists of a common header for every node followed by
+// type-specific data that may recurse (containers like Series/Parallel read a
+// child count and then recursively deserialize each child).
+
+pub const DeserializeError = error{
+    UnexpectedEof,
+    InvalidTypeName,
+    UnsupportedNetworkType,
+    UnsupportedOldFormat,
+    InvalidDimensions,
+    Unsupported2DLSTM,
+    OutOfMemory,
+};
+
+/// Mapping from Tesseract type name strings to our layer construction logic.
+const TypeMapping = struct {
+    name: []const u8,
+    kind: TypeKind,
+};
+
+const TypeKind = enum {
+    input,
+    convolve,
+    maxpool, // also Reconfig
+    series,
+    parallel,
+    reversed_rtl,
+    reversed_ttb,
+    xy_transpose,
+    lstm,
+    lstm_softmax,
+    lstm_binary_softmax,
+    fc_softmax,
+    fc_softmax_no_ctc,
+    fc_sigmoid,
+    fc_tanh,
+    fc_relu,
+    fc_linear,
+    par_bidi_lstm,
+    par_2d_lstm,
+};
+
+const type_mappings = [_]TypeMapping{
+    .{ .name = "Input", .kind = .input },
+    .{ .name = "Convolve", .kind = .convolve },
+    .{ .name = "Maxpool", .kind = .maxpool },
+    .{ .name = "Reconfig", .kind = .maxpool },
+    .{ .name = "Series", .kind = .series },
+    .{ .name = "Parallel", .kind = .parallel },
+    .{ .name = "RTLReversed", .kind = .reversed_rtl },
+    .{ .name = "TTBReversed", .kind = .reversed_ttb },
+    .{ .name = "XYTranspose", .kind = .xy_transpose },
+    .{ .name = "LSTM", .kind = .lstm },
+    .{ .name = "SummLSTM", .kind = .lstm },
+    .{ .name = "LSTMSoftmax", .kind = .lstm_softmax },
+    .{ .name = "LSTMBinarySoftmax", .kind = .lstm_binary_softmax },
+    .{ .name = "Softmax", .kind = .fc_softmax },
+    .{ .name = "SoftmaxNoCTC", .kind = .fc_softmax_no_ctc },
+    .{ .name = "Logistic", .kind = .fc_sigmoid },
+    .{ .name = "LinLogistic", .kind = .fc_sigmoid },
+    .{ .name = "Tanh", .kind = .fc_tanh },
+    .{ .name = "LinTanh", .kind = .fc_tanh },
+    .{ .name = "Relu", .kind = .fc_relu },
+    .{ .name = "Linear", .kind = .fc_linear },
+    .{ .name = "ParBidiLSTM", .kind = .par_bidi_lstm },
+    .{ .name = "Par2dLSTM", .kind = .par_2d_lstm },
+    .{ .name = "Replicated", .kind = .parallel },
+    .{ .name = "DepParUDLSTM", .kind = .parallel },
+};
+
+fn lookupTypeKind(name: []const u8) ?TypeKind {
+    for (type_mappings) |m| {
+        if (std.mem.eql(u8, m.name, name)) return m.kind;
+    }
+    return null;
+}
+
+/// Network flags (matching Tesseract network.h)
+const NF_LAYER_SPECIFIC_LR: i32 = 64;
+
+/// Deserialize a complete network graph from Tesseract binary format.
+/// Returns the root Layer. Caller must call deinitLayer() to free all resources.
+pub fn deserializeNetwork(allocator: std.mem.Allocator, reader: *weights_mod.BinaryReader) DeserializeError!Layer {
+    // ── Read common header ──
+    // First byte: i8 = 0 (NT_NONE marker indicating string-based type lookup)
+    const nt_marker = reader.readI8() catch return error.UnexpectedEof;
+    if (nt_marker != 0) return error.InvalidTypeName;
+
+    // Type name string
+    const type_name = reader.readString(allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.UnexpectedEof,
+    };
+    defer allocator.free(type_name);
+
+    const kind = lookupTypeKind(type_name) orelse return error.UnsupportedNetworkType;
+
+    // Training state (i8) - read and ignored for inference
+    _ = reader.readI8() catch return error.UnexpectedEof;
+    // Needs to backprop (i8) - read and ignored
+    _ = reader.readI8() catch return error.UnexpectedEof;
+    // Network flags (i32)
+    const network_flags = reader.readI32() catch return error.UnexpectedEof;
+    // ni (i32) - number of inputs
+    const ni_i32 = reader.readI32() catch return error.UnexpectedEof;
+    // no (i32) - number of outputs
+    const no_i32 = reader.readI32() catch return error.UnexpectedEof;
+    // num_weights (i32) - read and ignored
+    _ = reader.readI32() catch return error.UnexpectedEof;
+    // name string
+    const name = reader.readString(allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.UnexpectedEof,
+    };
+    defer allocator.free(name);
+
+    const ni: usize = if (ni_i32 > 0) @intCast(ni_i32) else 0;
+    const no: usize = if (no_i32 > 0) @intCast(no_i32) else 0;
+
+    // ── Dispatch to type-specific deserialization ──
+    switch (kind) {
+        .input => {
+            // StaticShape::DeSerialize: 5 x i32 (batch, height, width, depth, loss_type)
+            const batch = reader.readI32() catch return error.UnexpectedEof;
+            const height = reader.readI32() catch return error.UnexpectedEof;
+            const width = reader.readI32() catch return error.UnexpectedEof;
+            const depth = reader.readI32() catch return error.UnexpectedEof;
+            _ = reader.readI32() catch return error.UnexpectedEof; // loss_type, ignored
+
+            return Layer{ .input = InputLayer{
+                .ni = ni,
+                .no = no,
+                .batch = batch,
+                .height = height,
+                .width = width,
+                .depth = depth,
+            } };
+        },
+
+        .convolve => {
+            // Convolve::DeSerialize: i32 half_x, i32 half_y
+            const half_x_i32 = reader.readI32() catch return error.UnexpectedEof;
+            const half_y_i32 = reader.readI32() catch return error.UnexpectedEof;
+            _ = half_y_i32; // We only support 1D (half_y is always 0 for 1D)
+            const half_x: usize = @intCast(half_x_i32);
+
+            return Layer{ .convolve = ConvolveLayer.init(ni, half_x) };
+        },
+
+        .maxpool => {
+            // Reconfig::DeSerialize: i32 x_scale, i32 y_scale
+            const x_scale_i32 = reader.readI32() catch return error.UnexpectedEof;
+            _ = reader.readI32() catch return error.UnexpectedEof; // y_scale, ignored for 1D
+            const x_scale: usize = @intCast(x_scale_i32);
+
+            return Layer{ .maxpool = MaxpoolLayer.init(ni, x_scale) };
+        },
+
+        .series, .parallel, .par_bidi_lstm, .par_2d_lstm => {
+            return deserializePlumbing(allocator, reader, kind, ni, network_flags);
+        },
+
+        .reversed_rtl, .reversed_ttb, .xy_transpose => {
+            return deserializePlumbing(allocator, reader, kind, ni, network_flags);
+        },
+
+        .lstm, .lstm_softmax, .lstm_binary_softmax => {
+            return deserializeLSTM(allocator, reader, kind, ni, no);
+        },
+
+        .fc_softmax, .fc_softmax_no_ctc, .fc_sigmoid, .fc_tanh, .fc_relu, .fc_linear => {
+            const activation: ActivationType = switch (kind) {
+                .fc_softmax, .fc_softmax_no_ctc => .softmax,
+                .fc_sigmoid => .sigmoid,
+                .fc_tanh => .tanh,
+                .fc_relu => .relu,
+                .fc_linear => .linear,
+                else => unreachable,
+            };
+
+            // FullyConnected::DeSerialize: WeightMatrix::DeSerialize(training=false)
+            var wm = weights_mod.WeightMatrix.deserialize(allocator, reader) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.UnsupportedOldFormat => return error.UnsupportedOldFormat,
+                error.InvalidDimensions => return error.InvalidDimensions,
+                error.UnexpectedEof => return error.UnexpectedEof,
+            };
+            errdefer wm.deinit();
+
+            return Layer{ .fully_connected = FullyConnectedLayer{
+                .weights = wm,
+                .activation = activation,
+                .ni = wm.num_inputs,
+                .no = wm.num_outputs,
+            } };
+        },
+    }
+}
+
+/// Deserialize a Plumbing-derived type (Series, Parallel, Reversed).
+/// Reads child_count + children, optionally followed by per-layer learning rates.
+fn deserializePlumbing(
+    allocator: std.mem.Allocator,
+    reader: *weights_mod.BinaryReader,
+    kind: TypeKind,
+    ni: usize,
+    network_flags: i32,
+) DeserializeError!Layer {
+    // Plumbing::DeSerialize: u32 child_count, then child_count recursive networks
+    const child_count = reader.readU32() catch return error.UnexpectedEof;
+
+    const children = allocator.alloc(Layer, child_count) catch return error.OutOfMemory;
+    var children_initialized: usize = 0;
+    errdefer {
+        for (children[0..children_initialized]) |*child| {
+            deinitLayer(allocator, child);
+        }
+        allocator.free(children);
+    }
+
+    for (0..child_count) |i| {
+        children[i] = try deserializeNetwork(allocator, reader);
+        children_initialized += 1;
+    }
+
+    // If NF_LAYER_SPECIFIC_LR flag is set, read (and skip) the learning rate vector.
+    if ((network_flags & NF_LAYER_SPECIFIC_LR) != 0) {
+        // GenericVector<float>::DeSerialize: u32 count, then count * sizeof(float) bytes.
+        // Tesseract's Plumbing::learning_rates_ is std::vector<float>.
+        const lr_count = reader.readU32() catch return error.UnexpectedEof;
+        reader.skip(lr_count * 4) catch return error.UnexpectedEof;
+    }
+
+    switch (kind) {
+        .series => {
+            // Compute ni from first child, no from last child
+            var series_no: usize = 0;
+            if (children.len > 0) {
+                series_no = children[children.len - 1].numOutputs();
+            }
+            const series_ni: usize = if (children.len > 0) children[0].numInputs() else 0;
+
+            const series = allocator.create(SeriesLayer) catch return error.OutOfMemory;
+            series.* = SeriesLayer{
+                .layers = children,
+                .ni = series_ni,
+                .no = series_no,
+                .allocator = allocator,
+            };
+            return Layer{ .series = series };
+        },
+        .parallel, .par_bidi_lstm, .par_2d_lstm => {
+            var total_no: usize = 0;
+            for (children) |child| {
+                total_no += child.numOutputs();
+            }
+
+            const parallel = allocator.create(ParallelLayer) catch return error.OutOfMemory;
+            parallel.* = ParallelLayer{
+                .layers = children,
+                .ni = ni,
+                .no = total_no,
+                .allocator = allocator,
+            };
+            return Layer{ .parallel = parallel };
+        },
+        .reversed_rtl, .reversed_ttb, .xy_transpose => {
+            // Reversed has exactly 1 child
+            if (children.len != 1) return error.InvalidDimensions;
+
+            const rev_type: ReversedType = switch (kind) {
+                .reversed_rtl => .x_reversed,
+                .reversed_ttb => .y_reversed,
+                .xy_transpose => .xy_transpose,
+                else => unreachable,
+            };
+
+            const reversed = ReversedLayer.init(allocator, children[0], rev_type) catch return error.OutOfMemory;
+            // Free the children slice (the single child is now owned by ReversedLayer)
+            allocator.free(children);
+            // Clear the errdefer tracking since we transferred ownership
+            children_initialized = 0;
+
+            return Layer{ .reversed = reversed };
+        },
+        else => unreachable,
+    }
+}
+
+/// Deserialize an LSTM layer.
+/// Reads na_, then 4 gate weight matrices (CI, GI, GF1, GO).
+/// For LSTMSoftmax/LSTMBinarySoftmax types, also reads an embedded softmax network.
+fn deserializeLSTM(
+    allocator: std.mem.Allocator,
+    reader: *weights_mod.BinaryReader,
+    kind: TypeKind,
+    ni: usize,
+    no: usize,
+) DeserializeError!Layer {
+    // LSTM::DeSerialize: i32 na_
+    const na_i32 = reader.readI32() catch return error.UnexpectedEof;
+    if (na_i32 <= 0) return error.InvalidDimensions;
+    const na: usize = @intCast(na_i32);
+
+    // Determine ns (number of hidden states) from na and ni.
+    // For 1D LSTM: na = ni + ns, so ns = na - ni
+    // For 2D LSTM: na = ni + 2*ns, so ns = (na - ni) / 2
+    // We check for 2D after reading the first gate weights.
+
+    // Read 4 gate weight matrices: CI, GI, GF1, GO
+    // We read CI first to determine ns.
+    var gate_weights: [NUM_GATES_1D]weights_mod.WeightMatrix = undefined;
+    var gates_initialized: usize = 0;
+    errdefer {
+        for (0..gates_initialized) |g| {
+            gate_weights[g].deinit();
+        }
+    }
+
+    // Read CI
+    gate_weights[0] = weights_mod.WeightMatrix.deserialize(allocator, reader) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnsupportedOldFormat => return error.UnsupportedOldFormat,
+        error.InvalidDimensions => return error.InvalidDimensions,
+        error.UnexpectedEof => return error.UnexpectedEof,
+    };
+    gates_initialized = 1;
+
+    const ns = gate_weights[0].num_outputs;
+
+    // Check for 2D: if na - nf == ni + 2*ns, it's 2D
+    // For standard LSTM type (not softmax), nf = 0
+    const nf: usize = switch (kind) {
+        .lstm => 0,
+        .lstm_softmax => no,
+        .lstm_binary_softmax => blk: {
+            // ceil(log2(no))
+            if (no <= 1) break :blk 0;
+            var val: usize = no - 1;
+            var bits: usize = 0;
+            while (val > 0) {
+                val >>= 1;
+                bits += 1;
+            }
+            break :blk bits;
+        },
+        else => unreachable,
+    };
+
+    const is_2d = (na - nf) == ni + 2 * ns;
+    if (is_2d) return error.Unsupported2DLSTM;
+
+    // Read remaining gates: GI, GF1, GO
+    for (1..NUM_GATES_1D) |g| {
+        gate_weights[g] = weights_mod.WeightMatrix.deserialize(allocator, reader) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsupportedOldFormat => return error.UnsupportedOldFormat,
+            error.InvalidDimensions => return error.InvalidDimensions,
+            error.UnexpectedEof => return error.UnexpectedEof,
+        };
+        gates_initialized += 1;
+    }
+
+    // For LSTMSoftmax/LSTMBinarySoftmax, read the embedded softmax network.
+    // We skip this for now -- eng.traineddata uses plain LSTM type.
+    if (kind == .lstm_softmax or kind == .lstm_binary_softmax) {
+        return error.UnsupportedNetworkType;
+    }
+
+    // Allocate state buffers
+    const curr_state = allocator.alloc(f32, ns) catch return error.OutOfMemory;
+    errdefer allocator.free(curr_state);
+    @memset(curr_state, 0.0);
+
+    const curr_output = allocator.alloc(f32, ns) catch return error.OutOfMemory;
+    errdefer allocator.free(curr_output);
+    @memset(curr_output, 0.0);
+
+    return Layer{ .lstm = LSTMLayer{
+        .ni = ni,
+        .ns = ns,
+        .na = na,
+        .gate_weights = gate_weights,
+        .curr_state = curr_state,
+        .curr_output = curr_output,
+        .allocator = allocator,
+    } };
+}
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -1740,4 +2265,163 @@ test "Convolve in Layer union dispatches" {
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), out1[3], tol);
     try std.testing.expectApproxEqAbs(@as(f32, 5.0), out1[4], tol);
     try std.testing.expectApproxEqAbs(@as(f32, 6.0), out1[5], tol);
+}
+
+// ── Deserialization Integration Tests ────────────────────────────────────────
+
+const tessdata = @import("tessdata.zig");
+
+test "deserialize network from eng.traineddata" {
+    const allocator = std.testing.allocator;
+
+    // Load the model file
+    const file = std.fs.cwd().openFile("test/testdata/eng.traineddata", .{}) catch |err| {
+        std.debug.print("Skipping test: cannot open test file: {}\n", .{err});
+        return;
+    };
+    defer file.close();
+
+    const data = file.readToEndAlloc(allocator, 16 * 1024 * 1024) catch |err| {
+        std.debug.print("Skipping test: cannot read test file: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(data);
+
+    // Parse the container
+    const mgr = try tessdata.TessdataManager.init(data);
+    const lstm_data = mgr.getComponent(.lstm) orelse {
+        std.debug.print("Skipping test: no LSTM component\n", .{});
+        return;
+    };
+
+    // Deserialize the network graph
+    var reader = weights_mod.BinaryReader.init(lstm_data);
+    var root = try deserializeNetwork(allocator, &reader);
+    defer deinitLayer(allocator, &root);
+
+    // 1. Root should be a Series
+    try std.testing.expect(root == .series);
+    const series = root.series;
+
+    // 2. Should have multiple children
+    try std.testing.expect(series.layers.len > 0);
+
+    // 3. First child should be an Input layer
+    try std.testing.expect(series.layers[0] == .input);
+    const input_layer = series.layers[0].input;
+    // eng.traineddata Input: height=36, depth=1
+    try std.testing.expect(input_layer.height > 0);
+    try std.testing.expect(input_layer.depth >= 1);
+
+    // 4. Verify LSTM layers are present somewhere in the graph
+    var has_lstm = false;
+    for (series.layers) |layer| {
+        switch (layer) {
+            .lstm => {
+                has_lstm = true;
+            },
+            .reversed => |r| {
+                // LSTM is often inside a Reversed layer
+                switch (r.child) {
+                    .lstm => {
+                        has_lstm = true;
+                    },
+                    .series => |inner_s| {
+                        for (inner_s.layers) |inner_layer| {
+                            if (inner_layer == .lstm) has_lstm = true;
+                        }
+                    },
+                    else => {},
+                }
+            },
+            .parallel => |p| {
+                for (p.layers) |p_child| {
+                    switch (p_child) {
+                        .lstm => has_lstm = true,
+                        .reversed => |pr| {
+                            if (pr.child == .lstm) has_lstm = true;
+                        },
+                        .series => |ps| {
+                            for (ps.layers) |ps_child| {
+                                switch (ps_child) {
+                                    .lstm => has_lstm = true,
+                                    .reversed => |psr| {
+                                        if (psr.child == .lstm) has_lstm = true;
+                                    },
+                                    else => {},
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(has_lstm);
+
+    // 5. Last child should be a FC/Softmax layer
+    const last = series.layers[series.layers.len - 1];
+    try std.testing.expect(last == .fully_connected);
+    const fc_last = last.fully_connected;
+    try std.testing.expect(fc_last.activation == .softmax);
+
+    // 6. Verify reasonable dimensions
+    // The eng model has 111 Unicode characters + 1 null = 112 outputs
+    // (the Softmax outputs should match the unicharset size)
+    try std.testing.expect(fc_last.no > 50); // at least 50 output classes
+    try std.testing.expect(fc_last.no < 500); // sanity upper bound
+
+    // 7. Verify weight matrix dimensions are non-zero
+    try std.testing.expect(fc_last.weights.num_outputs > 0);
+    try std.testing.expect(fc_last.weights.num_inputs > 0);
+
+    // 8. Verify network ni/no make sense
+    try std.testing.expect(series.ni > 0);
+    try std.testing.expect(series.no > 0);
+    try std.testing.expectEqual(fc_last.no, series.no);
+
+    // 9. Count the layers for a sanity check
+    // eng.traineddata should have Input + several LSTM-related + Softmax
+    try std.testing.expect(series.layers.len >= 3);
+}
+
+test "deserialize network leaves recognizer metadata" {
+    const allocator = std.testing.allocator;
+
+    const file = std.fs.cwd().openFile("test/testdata/eng.traineddata", .{}) catch |err| {
+        std.debug.print("Skipping test: cannot open test file: {}\n", .{err});
+        return;
+    };
+    defer file.close();
+
+    const data = file.readToEndAlloc(allocator, 16 * 1024 * 1024) catch |err| {
+        std.debug.print("Skipping test: cannot read test file: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(data);
+
+    const mgr = try tessdata.TessdataManager.init(data);
+    const lstm_data = mgr.getComponent(.lstm).?;
+
+    var reader = weights_mod.BinaryReader.init(lstm_data);
+    var root = try deserializeNetwork(allocator, &reader);
+    defer deinitLayer(allocator, &root);
+
+    // The LSTM component contains the network graph followed by LSTMRecognizer
+    // metadata (spec string, training iteration, sample iteration, etc.).
+    // The network deserializer should consume the graph portion, leaving the
+    // recognizer metadata. For eng.traineddata this is ~81 bytes.
+    const remaining = reader.remaining();
+    try std.testing.expect(remaining > 0); // recognizer metadata present
+    try std.testing.expect(remaining < 256); // but not too much
+
+    // The remaining data starts with the network spec string.
+    // Verify it's a valid u32 length + ASCII string.
+    const spec_len = reader.readU32() catch unreachable;
+    try std.testing.expect(spec_len > 0 and spec_len < 256);
+    const spec_bytes = reader.readBytes(spec_len) catch unreachable;
+    // The spec string should start with '[' and contain layer descriptors.
+    try std.testing.expectEqual(@as(u8, '['), spec_bytes[0]);
 }
