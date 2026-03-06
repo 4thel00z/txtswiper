@@ -1,5 +1,79 @@
 const std = @import("std");
 
+// ── BinaryReader ────────────────────────────────────────────────────────────
+//
+// Cursor-based reader for Tesseract binary model data. All multi-byte integers
+// are little-endian. Strings are prefixed by a u32 length.
+
+pub const BinaryReader = struct {
+    data: []const u8,
+    pos: usize,
+
+    pub fn init(data: []const u8) BinaryReader {
+        return .{ .data = data, .pos = 0 };
+    }
+
+    pub fn remaining(self: BinaryReader) usize {
+        return if (self.pos <= self.data.len) self.data.len - self.pos else 0;
+    }
+
+    pub fn readU8(self: *BinaryReader) !u8 {
+        if (self.pos + 1 > self.data.len) return error.UnexpectedEof;
+        const val = self.data[self.pos];
+        self.pos += 1;
+        return val;
+    }
+
+    pub fn readI8(self: *BinaryReader) !i8 {
+        return @bitCast(try self.readU8());
+    }
+
+    pub fn readI32(self: *BinaryReader) !i32 {
+        if (self.pos + 4 > self.data.len) return error.UnexpectedEof;
+        const val = std.mem.readInt(i32, self.data[self.pos..][0..4], .little);
+        self.pos += 4;
+        return val;
+    }
+
+    pub fn readU32(self: *BinaryReader) !u32 {
+        if (self.pos + 4 > self.data.len) return error.UnexpectedEof;
+        const val = std.mem.readInt(u32, self.data[self.pos..][0..4], .little);
+        self.pos += 4;
+        return val;
+    }
+
+    pub fn readF64(self: *BinaryReader) !f64 {
+        if (self.pos + 8 > self.data.len) return error.UnexpectedEof;
+        const val = @as(f64, @bitCast(std.mem.readInt(u64, self.data[self.pos..][0..8], .little)));
+        self.pos += 8;
+        return val;
+    }
+
+    /// Read a Tesseract-format string: u32 length followed by length bytes.
+    /// Returns an owned copy allocated with the given allocator.
+    pub fn readString(self: *BinaryReader, allocator: std.mem.Allocator) ![]const u8 {
+        const len = try self.readU32();
+        if (self.pos + len > self.data.len) return error.UnexpectedEof;
+        const result = try allocator.dupe(u8, self.data[self.pos .. self.pos + len]);
+        self.pos += len;
+        return result;
+    }
+
+    /// Return a borrowed slice of `n` bytes and advance the cursor.
+    pub fn readBytes(self: *BinaryReader, n: usize) ![]const u8 {
+        if (self.pos + n > self.data.len) return error.UnexpectedEof;
+        const result = self.data[self.pos .. self.pos + n];
+        self.pos += n;
+        return result;
+    }
+
+    /// Skip `n` bytes.
+    pub fn skip(self: *BinaryReader, n: usize) !void {
+        if (self.pos + n > self.data.len) return error.UnexpectedEof;
+        self.pos += n;
+    }
+};
+
 // ── SIMD-accelerated dot product functions ──────────────────────────────────
 
 /// Float32 dot product using Zig @Vector SIMD where possible.
@@ -184,6 +258,113 @@ pub const WeightMatrix = struct {
             .scales = scales_arr,
             .allocator = allocator,
         };
+    }
+
+    // ── Deserialization mode flags (matching Tesseract weightmatrix.cpp) ────
+    const kInt8Flag: u8 = 0x01;
+    const kDoubleFlag: u8 = 0x80;
+
+    /// Deserialize a WeightMatrix from Tesseract binary format.
+    /// Handles both float (f64 -> f32) and int8 quantized modes.
+    ///
+    /// Binary layout:
+    ///   u8 mode_flags
+    ///   If float mode (kDoubleFlag set, kInt8Flag not set):
+    ///     GENERIC_2D_ARRAY<double>: i32 dim1, i32 dim2, f64 empty, f64[dim1*dim2]
+    ///   If int8 mode (both kDoubleFlag and kInt8Flag set):
+    ///     GENERIC_2D_ARRAY<int8>: i32 dim1, i32 dim2, i8 empty, i8[dim1*dim2]
+    ///     u32 scales_count, f64[scales_count] scales
+    pub fn deserialize(allocator: std.mem.Allocator, reader: *BinaryReader) !WeightMatrix {
+        const mode = try reader.readU8();
+
+        const is_int8 = (mode & kInt8Flag) != 0;
+        const is_double = (mode & kDoubleFlag) != 0;
+
+        if (!is_double) {
+            // Old float format -- not supported for inference-only.
+            return error.UnsupportedOldFormat;
+        }
+
+        if (is_int8) {
+            // ── Int8 mode ──
+            // Read GENERIC_2D_ARRAY<int8_t>
+            const dim1 = try reader.readI32();
+            const dim2 = try reader.readI32();
+            if (dim1 <= 0 or dim2 <= 0) return error.InvalidDimensions;
+            const num_outputs: usize = @intCast(dim1);
+            const num_cols: usize = @intCast(dim2); // includes bias column
+            const num_inputs = num_cols - 1;
+
+            _ = try reader.readI8(); // empty value (ignored)
+
+            const total = num_outputs * num_cols;
+            const wi = try allocator.alloc(i8, total);
+            errdefer allocator.free(wi);
+
+            // Read raw int8 data (row-major, matching our layout)
+            const raw = try reader.readBytes(total);
+            @memcpy(wi, @as([*]const i8, @ptrCast(raw.ptr))[0..total]);
+
+            // Read scales array
+            const scales_count = try reader.readU32();
+            const scales_arr = try allocator.alloc(f64, num_outputs);
+            errdefer allocator.free(scales_arr);
+
+            // Read scale values from file. Tesseract stores scale * 127,
+            // and at runtime divides by 127 to get the actual scale.
+            for (0..scales_count) |i| {
+                const val = try reader.readF64();
+                if (i < num_outputs) {
+                    scales_arr[i] = val / 127.0;
+                }
+            }
+            // If scales_count > num_outputs, we already consumed all bytes.
+            // If scales_count < num_outputs, pad remaining with 1.0.
+            if (scales_count < num_outputs) {
+                for (scales_count..num_outputs) |i| {
+                    scales_arr[i] = 1.0;
+                }
+            }
+
+            return WeightMatrix{
+                .num_outputs = num_outputs,
+                .num_inputs = num_inputs,
+                .wf = null,
+                .wi = wi,
+                .scales = scales_arr,
+                .allocator = allocator,
+            };
+        } else {
+            // ── Float mode ──
+            // Read GENERIC_2D_ARRAY<double>
+            const dim1 = try reader.readI32();
+            const dim2 = try reader.readI32();
+            if (dim1 <= 0 or dim2 <= 0) return error.InvalidDimensions;
+            const num_outputs: usize = @intCast(dim1);
+            const num_cols: usize = @intCast(dim2); // includes bias column
+            const num_inputs = num_cols - 1;
+
+            _ = try reader.readF64(); // empty value (ignored)
+
+            const total = num_outputs * num_cols;
+            const wf = try allocator.alloc(f32, total);
+            errdefer allocator.free(wf);
+
+            // Read f64 values and convert to f32 (row-major, matching our layout)
+            for (0..total) |i| {
+                const val = try reader.readF64();
+                wf[i] = @floatCast(val);
+            }
+
+            return WeightMatrix{
+                .num_outputs = num_outputs,
+                .num_inputs = num_inputs,
+                .wf = wf,
+                .wi = null,
+                .scales = null,
+                .allocator = allocator,
+            };
+        }
     }
 
     /// Quantized matrix-vector multiply using int8 weights.
@@ -455,4 +636,197 @@ test "WeightMatrix get/set roundtrip" {
 
     // Verify cols() returns num_inputs + 1.
     try std.testing.expectEqual(@as(usize, 6), wm.cols());
+}
+
+// ── WeightMatrix Deserialization Tests ──────────────────────────────────────
+
+test "WeightMatrix deserialize float mode" {
+    const allocator = std.testing.allocator;
+
+    // Build a synthetic float-mode WeightMatrix in Tesseract binary format:
+    //   mode = kDoubleFlag (0x80)
+    //   dim1 = 2 (num_outputs)
+    //   dim2 = 3 (num_inputs + 1 for bias = 2 inputs + 1)
+    //   empty = 0.0 (f64)
+    //   data = 6 doubles (row-major):
+    //     row0: [1.0, 2.0, 0.5]   (weights + bias)
+    //     row1: [3.0, 4.0, -1.0]  (weights + bias)
+    var buf: [1 + 4 + 4 + 8 + 6 * 8]u8 = undefined;
+    var pos: usize = 0;
+
+    // mode
+    buf[pos] = 0x80;
+    pos += 1;
+
+    // dim1 = 2
+    std.mem.writeInt(i32, buf[pos..][0..4], 2, .little);
+    pos += 4;
+    // dim2 = 3
+    std.mem.writeInt(i32, buf[pos..][0..4], 3, .little);
+    pos += 4;
+
+    // empty value (f64 0.0)
+    @as(*align(1) f64, @ptrCast(buf[pos .. pos + 8])).*  = 0.0;
+    pos += 8;
+
+    // Row 0: [1.0, 2.0, 0.5]
+    const vals = [_]f64{ 1.0, 2.0, 0.5, 3.0, 4.0, -1.0 };
+    for (vals) |v| {
+        @as(*align(1) f64, @ptrCast(buf[pos .. pos + 8])).* = v;
+        pos += 8;
+    }
+
+    var reader = BinaryReader.init(&buf);
+    var wm = try WeightMatrix.deserialize(allocator, &reader);
+    defer wm.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), wm.num_outputs);
+    try std.testing.expectEqual(@as(usize, 2), wm.num_inputs);
+    try std.testing.expect(wm.wf != null);
+    try std.testing.expect(wm.wi == null);
+
+    // Check weights
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), wm.get(0, 0), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), wm.get(0, 1), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), wm.get(0, 2), 1e-5); // bias
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), wm.get(1, 0), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), wm.get(1, 1), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), wm.get(1, 2), 1e-5); // bias
+
+    // Verify matVecFloat works with the deserialized matrix
+    const input = [_]f32{ 1.0, 1.0 };
+    var output: [2]f32 = undefined;
+    wm.matVecFloat(&input, &output);
+    // row0: 1*1 + 2*1 + 0.5 = 3.5
+    try std.testing.expectApproxEqAbs(@as(f32, 3.5), output[0], 1e-5);
+    // row1: 3*1 + 4*1 + (-1.0) = 6.0
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), output[1], 1e-5);
+
+    // All bytes consumed
+    try std.testing.expectEqual(@as(usize, 0), reader.remaining());
+}
+
+test "WeightMatrix deserialize int8 mode" {
+    const allocator = std.testing.allocator;
+
+    // Build a synthetic int8-mode WeightMatrix in Tesseract binary format:
+    //   mode = kDoubleFlag | kInt8Flag (0x81)
+    //   GENERIC_2D_ARRAY<int8>: dim1=2, dim2=3, empty=0, data=6 bytes
+    //   scales_count=2, scales=[2.54, 1.27] (stored as scale * 127)
+    const buf_size = 1 + 4 + 4 + 1 + 6 + 4 + 2 * 8;
+    var buf: [buf_size]u8 = undefined;
+    var pos: usize = 0;
+
+    // mode = 0x81
+    buf[pos] = 0x81;
+    pos += 1;
+
+    // dim1 = 2
+    std.mem.writeInt(i32, buf[pos..][0..4], 2, .little);
+    pos += 4;
+    // dim2 = 3
+    std.mem.writeInt(i32, buf[pos..][0..4], 3, .little);
+    pos += 4;
+
+    // empty value (i8 = 0)
+    buf[pos] = 0;
+    pos += 1;
+
+    // Int8 data: row0 = [127, -64, 10], row1 = [0, 100, -127]
+    const i8_vals = [_]i8{ 127, -64, 10, 0, 100, -127 };
+    for (i8_vals) |v| {
+        buf[pos] = @bitCast(v);
+        pos += 1;
+    }
+
+    // scales_count = 2
+    std.mem.writeInt(u32, buf[pos..][0..4], 2, .little);
+    pos += 4;
+
+    // scales: stored as scale * 127 in the file
+    // scale[0] = 0.02 -> file stores 0.02 * 127 = 2.54
+    // scale[1] = 0.01 -> file stores 0.01 * 127 = 1.27
+    @as(*align(1) f64, @ptrCast(buf[pos .. pos + 8])).* = 2.54;
+    pos += 8;
+    @as(*align(1) f64, @ptrCast(buf[pos .. pos + 8])).* = 1.27;
+    pos += 8;
+
+    var reader = BinaryReader.init(&buf);
+    var wm = try WeightMatrix.deserialize(allocator, &reader);
+    defer wm.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), wm.num_outputs);
+    try std.testing.expectEqual(@as(usize, 2), wm.num_inputs);
+    try std.testing.expect(wm.wf == null);
+    try std.testing.expect(wm.wi != null);
+    try std.testing.expect(wm.scales != null);
+
+    // Check int8 weights
+    const wi = wm.wi.?;
+    try std.testing.expectEqual(@as(i8, 127), wi[0]);
+    try std.testing.expectEqual(@as(i8, -64), wi[1]);
+    try std.testing.expectEqual(@as(i8, 10), wi[2]);
+    try std.testing.expectEqual(@as(i8, 0), wi[3]);
+    try std.testing.expectEqual(@as(i8, 100), wi[4]);
+    try std.testing.expectEqual(@as(i8, -127), wi[5]);
+
+    // Check scales (file value / 127)
+    const scales_arr = wm.scales.?;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.02), scales_arr[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.01), scales_arr[1], 1e-6);
+
+    // All bytes consumed
+    try std.testing.expectEqual(@as(usize, 0), reader.remaining());
+}
+
+test "BinaryReader basic operations" {
+    var buf: [21]u8 = undefined;
+
+    // Byte 0: u8 = 0xFF
+    buf[0] = 0xFF;
+    // Bytes 1-4: i32 = -42
+    std.mem.writeInt(i32, buf[1..5], -42, .little);
+    // Bytes 5-8: u32 = 1000
+    std.mem.writeInt(u32, buf[5..9], 1000, .little);
+    // Bytes 9-16: f64 = 3.14
+    @as(*align(1) f64, @ptrCast(buf[9..17])).* = 3.14;
+    // Bytes 17-20: string: u32 len=2 + "AB"
+    std.mem.writeInt(u32, buf[17..21], 2, .little);
+
+    // Extend buffer to include the string data
+    var full_buf: [23]u8 = undefined;
+    @memcpy(full_buf[0..21], &buf);
+    full_buf[21] = 'A';
+    full_buf[22] = 'B';
+
+    var reader = BinaryReader.init(&full_buf);
+
+    try std.testing.expectEqual(@as(usize, 23), reader.remaining());
+
+    const byte = try reader.readU8();
+    try std.testing.expectEqual(@as(u8, 0xFF), byte);
+
+    const i32_val = try reader.readI32();
+    try std.testing.expectEqual(@as(i32, -42), i32_val);
+
+    const u32_val = try reader.readU32();
+    try std.testing.expectEqual(@as(u32, 1000), u32_val);
+
+    const f64_val = try reader.readF64();
+    try std.testing.expectApproxEqAbs(@as(f64, 3.14), f64_val, 1e-10);
+
+    const str = try reader.readString(std.testing.allocator);
+    defer std.testing.allocator.free(str);
+    try std.testing.expectEqualStrings("AB", str);
+
+    try std.testing.expectEqual(@as(usize, 0), reader.remaining());
+}
+
+test "BinaryReader eof error" {
+    const buf = [_]u8{ 0x01 };
+    var reader = BinaryReader.init(&buf);
+    _ = try reader.readU8();
+    // Now at end, further reads should fail
+    try std.testing.expectError(error.UnexpectedEof, reader.readU8());
+    try std.testing.expectError(error.UnexpectedEof, reader.readI32());
 }
