@@ -270,6 +270,173 @@ pub const FullyConnectedLayer = struct {
     }
 };
 
+// ── LSTM Gate Definitions ────────────────────────────────────────────────────
+//
+// The LSTM uses a 5-gate architecture matching Tesseract:
+//   CI  = Cell Input (tanh)
+//   GI  = Input Gate (sigmoid)
+//   GF1 = Forget Gate 1D (sigmoid)
+//   GO  = Output Gate (sigmoid)
+//   GFS = Forget Gate 2D (sigmoid) - only used in 2D mode
+//
+// For 1D mode we use only the first 4 gates.
+
+pub const GateIndex = enum(u3) {
+    CI = 0, // Cell Input
+    GI = 1, // Input Gate
+    GF1 = 2, // Forget Gate (1D)
+    GO = 3, // Output Gate
+    GFS = 4, // Forget Gate (2D) - unused in 1D mode
+};
+
+const NUM_GATES_1D: usize = 4; // CI, GI, GF1, GO
+
+// ── LSTM Layer ───────────────────────────────────────────────────────────────
+//
+// Implements a 1D LSTM forward pass. At each timestep the layer concatenates
+// the external input with the previous hidden output, passes this through four
+// gated weight matrices (CI, GI, GF1, GO), updates the cell state, and
+// produces the hidden output.
+
+pub const LSTMLayer = struct {
+    ni: usize, // num external inputs
+    ns: usize, // num states (hidden units) = num outputs
+    na: usize, // concatenated input size = ni + ns
+    gate_weights: [NUM_GATES_1D]weights_mod.WeightMatrix,
+    /// Cell state persisted across timesteps within a single forward call [ns].
+    curr_state: []f32,
+    /// Hidden output persisted across timesteps within a single forward call [ns].
+    curr_output: []f32,
+    allocator: std.mem.Allocator,
+
+    /// Create an LSTM layer with `ni` external inputs and `ns` hidden states.
+    /// Each of the 4 gate weight matrices has shape [ns][na] (na = ni + ns).
+    pub fn init(allocator: std.mem.Allocator, ni: usize, ns: usize) !LSTMLayer {
+        const na = ni + ns;
+
+        var gate_weights: [NUM_GATES_1D]weights_mod.WeightMatrix = undefined;
+        var gates_initialised: usize = 0;
+        errdefer {
+            for (0..gates_initialised) |g| {
+                gate_weights[g].deinit();
+            }
+        }
+
+        for (0..NUM_GATES_1D) |g| {
+            gate_weights[g] = try weights_mod.WeightMatrix.initFloat(allocator, ns, na);
+            gates_initialised += 1;
+        }
+
+        const curr_state = try allocator.alloc(f32, ns);
+        errdefer allocator.free(curr_state);
+        @memset(curr_state, 0.0);
+
+        const curr_output = try allocator.alloc(f32, ns);
+        errdefer allocator.free(curr_output);
+        @memset(curr_output, 0.0);
+
+        return LSTMLayer{
+            .ni = ni,
+            .ns = ns,
+            .na = na,
+            .gate_weights = gate_weights,
+            .curr_state = curr_state,
+            .curr_output = curr_output,
+            .allocator = allocator,
+        };
+    }
+
+    /// Free all weight matrices and state buffers.
+    pub fn deinit(self: *LSTMLayer) void {
+        for (0..NUM_GATES_1D) |g| {
+            self.gate_weights[g].deinit();
+        }
+        self.allocator.free(self.curr_state);
+        self.allocator.free(self.curr_output);
+    }
+
+    /// Zero the cell state and hidden output (called at the start of each forward pass).
+    pub fn resetState(self: *LSTMLayer) void {
+        @memset(self.curr_state, 0.0);
+        @memset(self.curr_output, 0.0);
+    }
+
+    /// LSTM forward pass over all timesteps in `input`.
+    ///
+    /// For each timestep t:
+    ///   1. Construct concatenated input: [fresh_input | prev_output]
+    ///   2. Compute gate activations via weight matrices
+    ///   3. Update cell state: state = state * GF1 + CI * GI
+    ///   4. Compute output: output = tanh(state) * GO
+    pub fn forward(self: *LSTMLayer, input: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) !void {
+        std.debug.assert(input.numFeatures() == self.ni);
+
+        const w = input.width();
+        try output.resize(w, self.ns);
+
+        // Reset state for a fresh forward pass.
+        self.resetState();
+
+        // Allocate temporary buffers.
+        const curr_input = try allocator.alloc(f32, self.na);
+        defer allocator.free(curr_input);
+
+        // Temp gate outputs: one buffer per gate, each of size ns.
+        var temp_gates: [NUM_GATES_1D][]f32 = undefined;
+        var temps_allocated: usize = 0;
+        defer {
+            for (0..temps_allocated) |g| {
+                allocator.free(temp_gates[g]);
+            }
+        }
+        for (0..NUM_GATES_1D) |g| {
+            temp_gates[g] = try allocator.alloc(f32, self.ns);
+            temps_allocated += 1;
+        }
+
+        for (0..w) |t| {
+            // 1. CONSTRUCT INPUT: [fresh_input(0..ni) | prev_output(ni..na)]
+            input.readTimeStep(t, curr_input[0..self.ni]);
+            @memcpy(curr_input[self.ni..self.na], self.curr_output);
+
+            // 2. GATE COMPUTATIONS
+            const ci_idx = @intFromEnum(GateIndex.CI);
+            const gi_idx = @intFromEnum(GateIndex.GI);
+            const gf1_idx = @intFromEnum(GateIndex.GF1);
+            const go_idx = @intFromEnum(GateIndex.GO);
+
+            self.gate_weights[ci_idx].matVecFloat(curr_input, temp_gates[ci_idx]);
+            self.gate_weights[gi_idx].matVecFloat(curr_input, temp_gates[gi_idx]);
+            self.gate_weights[gf1_idx].matVecFloat(curr_input, temp_gates[gf1_idx]);
+            self.gate_weights[go_idx].matVecFloat(curr_input, temp_gates[go_idx]);
+
+            // Apply activations: CI=tanh, GI/GF1/GO=sigmoid
+            activations.tanh_inplace(temp_gates[ci_idx]);
+            activations.sigmoid_inplace(temp_gates[gi_idx]);
+            activations.sigmoid_inplace(temp_gates[gf1_idx]);
+            activations.sigmoid_inplace(temp_gates[go_idx]);
+
+            // 3. STATE UPDATE
+            for (0..self.ns) |i| {
+                // Forget old state
+                self.curr_state[i] *= temp_gates[gf1_idx][i];
+                // Add new input
+                self.curr_state[i] += temp_gates[ci_idx][i] * temp_gates[gi_idx][i];
+                // Clamp for numerical stability
+                self.curr_state[i] = math.clamp(self.curr_state[i], -100.0, 100.0);
+            }
+
+            // 4. OUTPUT: tanh(state) * GO
+            for (0..self.ns) |i| {
+                self.curr_output[i] = activations.tanh_fast(self.curr_state[i]) * temp_gates[go_idx][i];
+            }
+
+            // 5. WRITE OUTPUT
+            output.writeTimeStep(t, self.curr_output);
+        }
+    }
+};
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 test "NetworkIO create and read/write timestep (float)" {
@@ -608,4 +775,177 @@ test "FullyConnected forward sigmoid" {
     // t1: [sigmoid(-3.0), sigmoid(100.0)] = [~0.0474, 1.0]
     try std.testing.expectApproxEqAbs(activations.sigmoid(-3.0), out1[0], tol);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), out1[1], tol);
+}
+
+// ── LSTM Tests ───────────────────────────────────────────────────────────────
+
+test "LSTM forward single timestep" {
+    const allocator = std.testing.allocator;
+
+    // ni=2, ns=2  ->  na=4 (concatenated: [x0, x1, h0, h1])
+    var lstm = try LSTMLayer.init(allocator, 2, 2);
+    defer lstm.deinit();
+
+    // CI weights: identity on fresh input -> CI = tanh([x0, x1, 0, 0] * W_CI)
+    // Set CI to pass through: row0 takes x0, row1 takes x1
+    const ci = @intFromEnum(GateIndex.CI);
+    lstm.gate_weights[ci].set(0, 0, 1.0); // row0: weight on x0
+    lstm.gate_weights[ci].set(1, 1, 1.0); // row1: weight on x1
+
+    // GI weights: large positive bias so sigmoid -> ~1 (gate fully open)
+    const gi = @intFromEnum(GateIndex.GI);
+    lstm.gate_weights[gi].setBias(0, 10.0);
+    lstm.gate_weights[gi].setBias(1, 10.0);
+
+    // GF1 weights: large negative bias so sigmoid -> ~0 (forget everything)
+    const gf1 = @intFromEnum(GateIndex.GF1);
+    lstm.gate_weights[gf1].setBias(0, -10.0);
+    lstm.gate_weights[gf1].setBias(1, -10.0);
+
+    // GO weights: large positive bias so sigmoid -> ~1 (output gate open)
+    const go = @intFromEnum(GateIndex.GO);
+    lstm.gate_weights[go].setBias(0, 10.0);
+    lstm.gate_weights[go].setBias(1, 10.0);
+
+    // Input: single timestep with [1.0, 0.5]
+    var input = try NetworkIO.init(allocator, 1, 2, false);
+    defer input.deinit();
+    const t0_in = [_]f32{ 1.0, 0.5 };
+    input.writeTimeStep(0, &t0_in);
+
+    var output = try NetworkIO.init(allocator, 1, 1, false);
+    defer output.deinit();
+
+    try lstm.forward(&input, &output, allocator);
+
+    // With GF1~0 and GI~1:
+    //   state = 0 * ~0 + tanh(x) * ~1 = tanh(x)
+    //   output = tanh(state) * ~1 = tanh(tanh(x))
+    //
+    // For x0=1.0: tanh(1.0) ~ 0.7616, tanh(0.7616) ~ 0.6411
+    // For x1=0.5: tanh(0.5) ~ 0.4621, tanh(0.4621) ~ 0.4319
+    var out: [2]f32 = undefined;
+    output.readTimeStep(0, &out);
+
+    const tol: f32 = 0.02; // LUT tolerance
+    const expected0 = activations.tanh_fast(activations.tanh_fast(1.0));
+    const expected1 = activations.tanh_fast(activations.tanh_fast(0.5));
+    try std.testing.expectApproxEqAbs(expected0, out[0], tol);
+    try std.testing.expectApproxEqAbs(expected1, out[1], tol);
+
+    // Verify outputs are nonzero and reasonable (in [-1, 1])
+    try std.testing.expect(out[0] != 0.0);
+    try std.testing.expect(out[1] != 0.0);
+    try std.testing.expect(@abs(out[0]) <= 1.0);
+    try std.testing.expect(@abs(out[1]) <= 1.0);
+}
+
+test "LSTM forward multi timestep state carries" {
+    const allocator = std.testing.allocator;
+
+    // ni=1, ns=1  ->  na=2
+    var lstm = try LSTMLayer.init(allocator, 1, 1);
+    defer lstm.deinit();
+
+    // CI: pass through fresh input (weight on x0 = 1.0)
+    const ci = @intFromEnum(GateIndex.CI);
+    lstm.gate_weights[ci].set(0, 0, 1.0);
+
+    // GI: fully open (large positive bias)
+    const gi = @intFromEnum(GateIndex.GI);
+    lstm.gate_weights[gi].setBias(0, 10.0);
+
+    // GF1: partially open (bias=2.0 -> sigmoid(2.0)~0.88), so state accumulates
+    const gf1 = @intFromEnum(GateIndex.GF1);
+    lstm.gate_weights[gf1].setBias(0, 2.0);
+
+    // GO: fully open
+    const go = @intFromEnum(GateIndex.GO);
+    lstm.gate_weights[go].setBias(0, 10.0);
+
+    // Input: 5 timesteps, each with [0.5]
+    var input = try NetworkIO.init(allocator, 5, 1, false);
+    defer input.deinit();
+    for (0..5) |t| {
+        const val = [_]f32{0.5};
+        input.writeTimeStep(t, &val);
+    }
+
+    var output = try NetworkIO.init(allocator, 1, 1, false);
+    defer output.deinit();
+
+    try lstm.forward(&input, &output, allocator);
+
+    // Read outputs at t=0 and t=4
+    var out0: [1]f32 = undefined;
+    var out4: [1]f32 = undefined;
+    output.readTimeStep(0, &out0);
+    output.readTimeStep(4, &out4);
+
+    // Verify outputs change over time (state accumulates so they should differ)
+    try std.testing.expect(out0[0] != out4[0]);
+
+    // Verify all outputs are nonzero
+    for (0..5) |t| {
+        var out: [1]f32 = undefined;
+        output.readTimeStep(t, &out);
+        try std.testing.expect(out[0] != 0.0);
+    }
+}
+
+test "LSTM forward zero input produces zero output" {
+    const allocator = std.testing.allocator;
+
+    // ni=2, ns=2 -> na=4
+    // All weights and biases are zero (default from initFloat).
+    var lstm = try LSTMLayer.init(allocator, 2, 2);
+    defer lstm.deinit();
+
+    // Input: 3 timesteps, all zeros (default from NetworkIO.init).
+    var input = try NetworkIO.init(allocator, 3, 2, false);
+    defer input.deinit();
+
+    var output = try NetworkIO.init(allocator, 1, 1, false);
+    defer output.deinit();
+
+    try lstm.forward(&input, &output, allocator);
+
+    // With all-zero weights and all-zero input:
+    //   gate_output = W * 0 + 0 = 0 for all gates
+    //   CI = tanh(0) = 0,  GI = sigmoid(0) = 0.5,  GF1 = sigmoid(0) = 0.5,  GO = sigmoid(0) = 0.5
+    //   state = state * 0.5 + 0 * 0.5 = 0  (starts at 0, stays 0)
+    //   output = tanh(0) * 0.5 = 0
+    const tol: f32 = 1e-6;
+    for (0..3) |t| {
+        var out: [2]f32 = undefined;
+        output.readTimeStep(t, &out);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[0], tol);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[1], tol);
+    }
+}
+
+test "LSTM output dimensions correct" {
+    const allocator = std.testing.allocator;
+
+    // ni=4, ns=3 -> na=7
+    var lstm = try LSTMLayer.init(allocator, 4, 3);
+    defer lstm.deinit();
+
+    // Verify internal dimensions.
+    try std.testing.expectEqual(@as(usize, 4), lstm.ni);
+    try std.testing.expectEqual(@as(usize, 3), lstm.ns);
+    try std.testing.expectEqual(@as(usize, 7), lstm.na);
+
+    // Input: width=10, features=4
+    var input = try NetworkIO.init(allocator, 10, 4, false);
+    defer input.deinit();
+
+    var output = try NetworkIO.init(allocator, 1, 1, false);
+    defer output.deinit();
+
+    try lstm.forward(&input, &output, allocator);
+
+    // Verify output dimensions: width=10, features=3
+    try std.testing.expectEqual(@as(usize, 10), output.width());
+    try std.testing.expectEqual(@as(usize, 3), output.numFeatures());
 }
