@@ -44,6 +44,25 @@ pub const TessdataError = error{
     OffsetOutOfRange,
 };
 
+pub const UnicharsetError = error{
+    /// Data is empty or contains no lines.
+    EmptyData,
+    /// First line is not a valid integer count.
+    BadCharCount,
+    /// More data lines than the declared count.
+    TooManyEntries,
+    /// Fewer data lines than the declared count.
+    TooFewEntries,
+    /// A line has no fields at all.
+    EmptyLine,
+    /// Properties field is not a valid hex integer.
+    BadProperties,
+    /// other_case / direction / mirror field is not a valid integer.
+    BadIntField,
+    /// Memory allocation failed.
+    OutOfMemory,
+};
+
 // ── TessdataManager ──────────────────────────────────────────────────────────
 
 /// Maximum num_entries value before we assume the file is big-endian.
@@ -156,6 +175,247 @@ pub const TessdataManager = struct {
     /// Returns true if the given component is present.
     pub fn hasComponent(self: TessdataManager, comp_type: TessdataType) bool {
         return self.offsets[@intFromEnum(comp_type)] != -1;
+    }
+};
+
+// ── Unicharset ──────────────────────────────────────────────────────────────
+
+/// Property bit flags for UNICHAR entries (hex-encoded in the text format).
+/// bit0 = alpha, bit1 = lower, bit2 = upper, bit3 = digit, bit4 = punct
+const CHAR_PROP_ALPHA: u8 = 0x01;
+const CHAR_PROP_LOWER: u8 = 0x02;
+const CHAR_PROP_UPPER: u8 = 0x04;
+const CHAR_PROP_DIGIT: u8 = 0x08;
+const CHAR_PROP_PUNCT: u8 = 0x10;
+
+/// Parses the UNICHARSET text format used by Tesseract OCR.
+///
+/// The UNICHARSET maps integer IDs to Unicode characters and their properties.
+/// The LSTM recognizer uses it to decode network output (class IDs) back to
+/// Unicode strings.
+///
+/// Format:
+///   - First line: integer count of characters
+///   - Following lines: one per character with space-separated fields
+///   - "NULL" on the first entry means the space character (ASCII 32)
+///
+/// Unicharset owns all string data; call deinit() to release memory.
+pub const Unicharset = struct {
+    chars: []UnicharEntry,
+    allocator: std.mem.Allocator,
+
+    pub const UnicharEntry = struct {
+        unichar: []const u8, // UTF-8 string (owned copy)
+        properties: u8, // hex property flags
+        script: []const u8, // script name (owned copy)
+        other_case: u32, // UNICHAR_ID of case pair
+        direction: u8, // 0-22
+        mirror: u32, // UNICHAR_ID of mirror
+        normed: []const u8, // normalized form (owned copy)
+    };
+
+    /// Parse a UNICHARSET from raw text data (as returned by TessdataManager.getComponent).
+    pub fn load(allocator: std.mem.Allocator, data: []const u8) (UnicharsetError || std.mem.Allocator.Error)!Unicharset {
+        if (data.len == 0) return UnicharsetError.EmptyData;
+
+        var line_iter = std.mem.splitScalar(u8, data, '\n');
+
+        // First line: character count.
+        const count_line = line_iter.next() orelse return UnicharsetError.EmptyData;
+        const char_count = std.fmt.parseInt(u32, std.mem.trim(u8, count_line, &std.ascii.whitespace), 10) catch {
+            return UnicharsetError.BadCharCount;
+        };
+
+        // Allocate entry array.
+        const chars = try allocator.alloc(UnicharEntry, char_count);
+
+        // Track how many entries have been fully populated so errdefer can
+        // release their owned strings.
+        var populated: u32 = 0;
+        errdefer {
+            for (chars[0..populated]) |*entry| {
+                if (entry.unichar.len > 0) allocator.free(entry.unichar);
+                if (entry.script.len > 0) allocator.free(entry.script);
+                if (entry.normed.len > 0) allocator.free(entry.normed);
+            }
+            allocator.free(chars);
+        }
+
+        var idx: u32 = 0;
+        while (line_iter.next()) |raw_line| {
+            // Skip trailing empty lines (common after last entry).
+            if (raw_line.len == 0) continue;
+
+            if (idx >= char_count) return UnicharsetError.TooManyEntries;
+
+            // Strip debug comment: everything after \t# is ignored.
+            const line = if (std.mem.indexOf(u8, raw_line, "\t#")) |tab_pos|
+                raw_line[0..tab_pos]
+            else
+                raw_line;
+
+            // Parse fields (space-separated).
+            var fields = std.mem.splitScalar(u8, std.mem.trimRight(u8, line, &std.ascii.whitespace), ' ');
+
+            // Field 0: unichar string.
+            const unichar_raw = fields.next() orelse return UnicharsetError.EmptyLine;
+
+            // "NULL" is the space character.
+            const unichar_str = if (std.mem.eql(u8, unichar_raw, "NULL")) " " else unichar_raw;
+
+            // Field 1: properties (hex integer).
+            const props_str = fields.next() orelse {
+                // Minimal line: just the unichar. Use defaults.
+                chars[idx] = UnicharEntry{
+                    .unichar = try allocator.dupe(u8, unichar_str),
+                    .properties = 0,
+                    .script = &.{},
+                    .other_case = 0,
+                    .direction = 0,
+                    .mirror = 0,
+                    .normed = &.{},
+                };
+                idx += 1;
+                populated = idx;
+                continue;
+            };
+            const properties: u8 = std.fmt.parseInt(u8, props_str, 16) catch {
+                return UnicharsetError.BadProperties;
+            };
+
+            // Field 2: either metrics (contains commas) or script name.
+            const field2 = fields.next();
+
+            var script_str: []const u8 = "Common";
+            var other_case: u32 = 0;
+            var direction: u8 = 0;
+            var mirror: u32 = 0;
+            var normed_str: []const u8 = unichar_str;
+
+            if (field2) |f2| {
+                if (std.mem.indexOfScalar(u8, f2, ',') != null) {
+                    // f2 is the metrics field (comma-separated values) - skip it.
+                    // Field 3: script
+                    if (fields.next()) |s| {
+                        script_str = s;
+                    }
+                    // Field 4: other_case
+                    if (fields.next()) |oc| {
+                        other_case = std.fmt.parseInt(u32, oc, 10) catch return UnicharsetError.BadIntField;
+                    }
+                    // Field 5: direction
+                    if (fields.next()) |d| {
+                        direction = std.fmt.parseInt(u8, d, 10) catch return UnicharsetError.BadIntField;
+                    }
+                    // Field 6: mirror
+                    if (fields.next()) |m| {
+                        mirror = std.fmt.parseInt(u32, m, 10) catch return UnicharsetError.BadIntField;
+                    }
+                    // Field 7: normed
+                    if (fields.next()) |n| {
+                        normed_str = if (std.mem.eql(u8, n, "NULL")) " " else n;
+                    }
+                } else {
+                    // f2 is the script name (short format, no metrics).
+                    script_str = f2;
+                    // Field 3: other_case
+                    if (fields.next()) |oc| {
+                        other_case = std.fmt.parseInt(u32, oc, 10) catch return UnicharsetError.BadIntField;
+                    }
+                    // Remaining fields in short format are optional.
+                    if (fields.next()) |d| {
+                        direction = std.fmt.parseInt(u8, d, 10) catch return UnicharsetError.BadIntField;
+                    }
+                    if (fields.next()) |m| {
+                        mirror = std.fmt.parseInt(u32, m, 10) catch return UnicharsetError.BadIntField;
+                    }
+                    if (fields.next()) |n| {
+                        normed_str = if (std.mem.eql(u8, n, "NULL")) " " else n;
+                    }
+                }
+            }
+
+            // Allocate owned copies of strings.
+            const owned_unichar = try allocator.dupe(u8, unichar_str);
+            errdefer allocator.free(owned_unichar);
+            const owned_script = try allocator.dupe(u8, script_str);
+            errdefer allocator.free(owned_script);
+            const owned_normed = try allocator.dupe(u8, normed_str);
+            errdefer allocator.free(owned_normed);
+
+            chars[idx] = UnicharEntry{
+                .unichar = owned_unichar,
+                .properties = properties,
+                .script = owned_script,
+                .other_case = other_case,
+                .direction = direction,
+                .mirror = mirror,
+                .normed = owned_normed,
+            };
+
+            idx += 1;
+            populated = idx;
+        }
+
+        if (idx < char_count) return UnicharsetError.TooFewEntries;
+
+        return Unicharset{
+            .chars = chars,
+            .allocator = allocator,
+        };
+    }
+
+    /// Release all owned memory.
+    pub fn deinit(self: *Unicharset) void {
+        for (self.chars) |*entry| {
+            if (entry.unichar.len > 0) self.allocator.free(entry.unichar);
+            if (entry.script.len > 0) self.allocator.free(entry.script);
+            if (entry.normed.len > 0) self.allocator.free(entry.normed);
+        }
+        self.allocator.free(self.chars);
+        self.chars = &.{};
+    }
+
+    /// Number of characters in this UNICHARSET.
+    pub fn size(self: Unicharset) usize {
+        return self.chars.len;
+    }
+
+    /// Map a UNICHAR_ID to its UTF-8 string representation.
+    /// Returns an empty string if the ID is out of range.
+    pub fn unicharToStr(self: Unicharset, id: u32) []const u8 {
+        if (id >= self.chars.len) return "";
+        return self.chars[id].unichar;
+    }
+
+    /// Returns true if the character at `id` has the alpha property.
+    pub fn isAlpha(self: Unicharset, id: u32) bool {
+        if (id >= self.chars.len) return false;
+        return self.chars[id].properties & CHAR_PROP_ALPHA != 0;
+    }
+
+    /// Returns true if the character at `id` has the digit property.
+    pub fn isDigit(self: Unicharset, id: u32) bool {
+        if (id >= self.chars.len) return false;
+        return self.chars[id].properties & CHAR_PROP_DIGIT != 0;
+    }
+
+    /// Returns true if the character at `id` has the upper-case property.
+    pub fn isUpper(self: Unicharset, id: u32) bool {
+        if (id >= self.chars.len) return false;
+        return self.chars[id].properties & CHAR_PROP_UPPER != 0;
+    }
+
+    /// Returns true if the character at `id` has the lower-case property.
+    pub fn isLower(self: Unicharset, id: u32) bool {
+        if (id >= self.chars.len) return false;
+        return self.chars[id].properties & CHAR_PROP_LOWER != 0;
+    }
+
+    /// Returns true if the character at `id` has the punctuation property.
+    pub fn isPunct(self: Unicharset, id: u32) bool {
+        if (id >= self.chars.len) return false;
+        return self.chars[id].properties & CHAR_PROP_PUNCT != 0;
     }
 };
 
@@ -342,4 +602,184 @@ test "TessdataType enum values" {
     try std.testing.expectEqual(@as(u8, 17), @intFromEnum(TessdataType.lstm));
     try std.testing.expectEqual(@as(u8, 21), @intFromEnum(TessdataType.lstm_unicharset));
     try std.testing.expectEqual(@as(u8, 23), @intFromEnum(TessdataType.version));
+}
+
+// ── Unicharset Tests ────────────────────────────────────────────────────────
+
+test "load unicharset from eng.traineddata" {
+    const file = std.fs.cwd().openFile("test/testdata/eng.traineddata", .{}) catch |err| {
+        std.debug.print("Skipping test: cannot open test file: {}\n", .{err});
+        return;
+    };
+    defer file.close();
+
+    const data = file.readToEndAlloc(std.testing.allocator, 16 * 1024 * 1024) catch |err| {
+        std.debug.print("Skipping test: cannot read test file: {}\n", .{err});
+        return;
+    };
+    defer std.testing.allocator.free(data);
+
+    const mgr = try TessdataManager.init(data);
+    const unicharset_data = mgr.getComponent(.lstm_unicharset).?;
+
+    var uc = try Unicharset.load(std.testing.allocator, unicharset_data);
+    defer uc.deinit();
+
+    // 112 characters in eng.traineddata LSTM unicharset.
+    try std.testing.expectEqual(@as(usize, 112), uc.size());
+
+    // ID 0: NULL → space character.
+    try std.testing.expectEqualStrings(" ", uc.unicharToStr(0));
+
+    // ID 3: "C" (uppercase letter).
+    try std.testing.expectEqualStrings("C", uc.unicharToStr(3));
+    try std.testing.expect(uc.isAlpha(3));
+    try std.testing.expect(uc.isUpper(3));
+    try std.testing.expect(!uc.isLower(3));
+    try std.testing.expect(!uc.isDigit(3));
+    try std.testing.expect(!uc.isPunct(3));
+
+    // ID 3: script should be "Latin".
+    try std.testing.expectEqualStrings("Latin", uc.chars[3].script);
+
+    // ID 3: other_case should be 87 (lowercase 'c' equivalent).
+    try std.testing.expectEqual(@as(u32, 87), uc.chars[3].other_case);
+
+    // ID 7 ("-"): punctuation.
+    // Properties hex 10 = 0x10 = bit4 = punct.
+    try std.testing.expectEqualStrings("-", uc.unicharToStr(7));
+    try std.testing.expect(uc.isPunct(7));
+    try std.testing.expect(!uc.isAlpha(7));
+    try std.testing.expect(!uc.isDigit(7));
+
+    // ID 14 ("8"): digit.
+    // Properties hex 8 = 0x08 = bit3 = digit.
+    try std.testing.expectEqualStrings("8", uc.unicharToStr(14));
+    try std.testing.expect(uc.isDigit(14));
+    try std.testing.expect(!uc.isAlpha(14));
+
+    // ID 1 ("Joined"): special entry, properties 0x07 = alpha+lower+upper.
+    try std.testing.expectEqualStrings("Joined", uc.unicharToStr(1));
+    try std.testing.expect(uc.isAlpha(1));
+
+    // ID 111 ("é"): lowercase alpha.
+    try std.testing.expectEqualStrings("\xc3\xa9", uc.unicharToStr(111)); // é in UTF-8
+    try std.testing.expect(uc.isAlpha(111));
+    try std.testing.expect(uc.isLower(111));
+
+    // Out-of-range ID returns empty string.
+    try std.testing.expectEqualStrings("", uc.unicharToStr(999));
+    try std.testing.expect(!uc.isAlpha(999));
+}
+
+test "unicharset property bit flags" {
+    // Synthetic unicharset to verify each property bit independently.
+    const data =
+        "5\n" ++
+        "NULL 0 Common 0\n" ++ // ID 0: space, no properties
+        "a 3 0,255,0,255,0,0,0,0,0,0 Latin 0 0 0 a\n" ++ // ID 1: alpha+lower
+        "A 5 0,255,0,255,0,0,0,0,0,0 Latin 1 0 1 A\n" ++ // ID 2: alpha+upper
+        "7 8 0,255,0,255,0,0,0,0,0,0 Common 3 2 3 7\n" ++ // ID 3: digit
+        ". 10 0,255,0,255,0,0,0,0,0,0 Common 4 6 4 .\n"; // ID 4: punct
+
+    var uc = try Unicharset.load(std.testing.allocator, data);
+    defer uc.deinit();
+
+    try std.testing.expectEqual(@as(usize, 5), uc.size());
+
+    // ID 0: space - no properties.
+    try std.testing.expectEqualStrings(" ", uc.unicharToStr(0));
+    try std.testing.expect(!uc.isAlpha(0));
+    try std.testing.expect(!uc.isLower(0));
+    try std.testing.expect(!uc.isUpper(0));
+    try std.testing.expect(!uc.isDigit(0));
+    try std.testing.expect(!uc.isPunct(0));
+
+    // ID 1: "a" - alpha + lower.
+    try std.testing.expect(uc.isAlpha(1));
+    try std.testing.expect(uc.isLower(1));
+    try std.testing.expect(!uc.isUpper(1));
+
+    // ID 2: "A" - alpha + upper.
+    try std.testing.expect(uc.isAlpha(2));
+    try std.testing.expect(uc.isUpper(2));
+    try std.testing.expect(!uc.isLower(2));
+
+    // ID 3: "7" - digit.
+    try std.testing.expect(uc.isDigit(3));
+    try std.testing.expect(!uc.isAlpha(3));
+
+    // ID 4: "." - punct.
+    try std.testing.expect(uc.isPunct(4));
+    try std.testing.expect(!uc.isAlpha(4));
+
+    // Verify other_case linkage.
+    try std.testing.expectEqual(@as(u32, 0), uc.chars[1].other_case); // 'a' -> 0
+    try std.testing.expectEqual(@as(u32, 1), uc.chars[2].other_case); // 'A' -> 1
+}
+
+test "unicharset empty set" {
+    const data = "0\n";
+    var uc = try Unicharset.load(std.testing.allocator, data);
+    defer uc.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), uc.size());
+    try std.testing.expectEqualStrings("", uc.unicharToStr(0));
+    try std.testing.expect(!uc.isAlpha(0));
+}
+
+test "unicharset single entry" {
+    const data = "1\nNULL 0 Common 0\n";
+    var uc = try Unicharset.load(std.testing.allocator, data);
+    defer uc.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), uc.size());
+    try std.testing.expectEqualStrings(" ", uc.unicharToStr(0));
+}
+
+test "unicharset short format lines" {
+    // Lines with just unichar + properties + script + other_case (no metrics).
+    const data =
+        "2\n" ++
+        "NULL 0 Common 0\n" ++
+        "X 5 Latin 0\n";
+
+    var uc = try Unicharset.load(std.testing.allocator, data);
+    defer uc.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), uc.size());
+    try std.testing.expectEqualStrings(" ", uc.unicharToStr(0));
+    try std.testing.expectEqualStrings("X", uc.unicharToStr(1));
+    try std.testing.expect(uc.isAlpha(1));
+    try std.testing.expect(uc.isUpper(1));
+    try std.testing.expectEqualStrings("Latin", uc.chars[1].script);
+}
+
+test "unicharset error on empty data" {
+    try std.testing.expectError(UnicharsetError.EmptyData, Unicharset.load(std.testing.allocator, ""));
+}
+
+test "unicharset error on bad count" {
+    try std.testing.expectError(UnicharsetError.BadCharCount, Unicharset.load(std.testing.allocator, "abc\n"));
+}
+
+test "unicharset error on count mismatch" {
+    // Declared 3 but only 1 line of data.
+    try std.testing.expectError(UnicharsetError.TooFewEntries, Unicharset.load(std.testing.allocator, "3\nNULL 0 Common 0\n"));
+}
+
+test "unicharset normed field and comment stripping" {
+    const data =
+        "1\n" ++
+        "C 5 0,255,0,255,0,0,0,0,0,0 Latin 87 0 3 C\t# C [43 ]A\n";
+
+    var uc = try Unicharset.load(std.testing.allocator, data);
+    defer uc.deinit();
+
+    try std.testing.expectEqualStrings("C", uc.chars[0].unichar);
+    try std.testing.expectEqualStrings("C", uc.chars[0].normed);
+    try std.testing.expectEqualStrings("Latin", uc.chars[0].script);
+    try std.testing.expectEqual(@as(u32, 87), uc.chars[0].other_case);
+    try std.testing.expectEqual(@as(u8, 0), uc.chars[0].direction);
+    try std.testing.expectEqual(@as(u32, 3), uc.chars[0].mirror);
 }
