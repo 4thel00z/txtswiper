@@ -11,7 +11,6 @@ pub fn dot_product(a: []const f32, b: []const f32) f32 {
 
     const vec_len = 8;
     const chunks = a.len / vec_len;
-    const remainder = a.len % vec_len;
 
     var acc: @Vector(vec_len, f32) = @splat(0.0);
 
@@ -31,7 +30,6 @@ pub fn dot_product(a: []const f32, b: []const f32) f32 {
         sum += a[i] * b[i];
     }
 
-    _ = remainder;
     return sum;
 }
 
