@@ -437,6 +437,232 @@ pub const LSTMLayer = struct {
     }
 };
 
+// ── Layer Union ──────────────────────────────────────────────────────────────
+//
+// A tagged union that can hold any layer type. This allows SeriesLayer and
+// ParallelLayer to compose arbitrary child layers. Series and Parallel use
+// pointers because the union type is recursive (they contain slices of Layer).
+
+/// Error set shared by all layer forward methods. Explicit because the
+/// Layer -> Series/Parallel -> Layer recursion prevents Zig from inferring
+/// the error set automatically.
+pub const ForwardError = std.mem.Allocator.Error;
+
+pub const Layer = union(enum) {
+    fully_connected: FullyConnectedLayer,
+    lstm: LSTMLayer,
+    series: *SeriesLayer,
+    parallel: *ParallelLayer,
+
+    /// Dispatch forward to the underlying layer.
+    pub fn forward(self: *Layer, input: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) ForwardError!void {
+        switch (self.*) {
+            .fully_connected => |*fc| try fc.forward(input, output, allocator),
+            .lstm => |*l| try l.forward(input, output, allocator),
+            .series => |s| try s.forward(input, output, allocator),
+            .parallel => |p| try p.forward(input, output, allocator),
+        }
+    }
+
+    /// Return the number of output features for this layer.
+    pub fn numOutputs(self: Layer) usize {
+        return switch (self) {
+            .fully_connected => |fc| fc.no,
+            .lstm => |l| l.ns,
+            .series => |s| s.no,
+            .parallel => |p| p.no,
+        };
+    }
+};
+
+// ── SeriesLayer ──────────────────────────────────────────────────────────────
+//
+// Chains a sequence of layers: the output of layer N becomes the input of
+// layer N+1. The overall input dimension equals the first layer's input
+// dimension, and the overall output dimension equals the last layer's output
+// dimension.
+
+pub const SeriesLayer = struct {
+    layers: []Layer,
+    ni: usize, // input features (= first layer's input count)
+    no: usize, // output features (= last layer's output count)
+    allocator: std.mem.Allocator,
+
+    /// Allocate a SeriesLayer on the heap. Copies the provided layers slice.
+    /// Sets ni from the first layer and no from the last layer.
+    pub fn init(allocator: std.mem.Allocator, layers: []const Layer) !*SeriesLayer {
+        const owned_layers = try allocator.alloc(Layer, layers.len);
+        @memcpy(owned_layers, layers);
+
+        const ni: usize = if (layers.len > 0) switch (layers[0]) {
+            .fully_connected => |fc| fc.ni,
+            .lstm => |l| l.ni,
+            .series => |s| s.ni,
+            .parallel => |p| p.ni,
+        } else 0;
+
+        const no: usize = if (layers.len > 0) layers[layers.len - 1].numOutputs() else 0;
+
+        const self = try allocator.create(SeriesLayer);
+        self.* = SeriesLayer{
+            .layers = owned_layers,
+            .ni = ni,
+            .no = no,
+            .allocator = allocator,
+        };
+        return self;
+    }
+
+    /// Free the layers slice and the SeriesLayer itself.
+    pub fn deinit(self: *SeriesLayer) void {
+        self.allocator.free(self.layers);
+        self.allocator.destroy(self);
+    }
+
+    /// Forward pass: chain layers sequentially.
+    /// - 0 layers: copy input to output
+    /// - 1 layer: forward through that single layer
+    /// - 2+ layers: alternate between two temp buffers, final layer writes to output
+    pub fn forward(self: *SeriesLayer, input: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) ForwardError!void {
+        const n = self.layers.len;
+
+        if (n == 0) {
+            // No-op: copy input to output
+            try output.resize(input.width(), input.numFeatures());
+            for (0..input.width()) |t| {
+                output.copyTimeStepFrom(t, input, t);
+            }
+            return;
+        }
+
+        if (n == 1) {
+            try self.layers[0].forward(input, output, allocator);
+            return;
+        }
+
+        // 2+ layers: use alternating temp buffers
+        var buf_a = try NetworkIO.init(allocator, 1, 1, false);
+        defer buf_a.deinit();
+        var buf_b = try NetworkIO.init(allocator, 1, 1, false);
+        defer buf_b.deinit();
+
+        // First layer: input -> buf_a
+        try self.layers[0].forward(input, &buf_a, allocator);
+
+        // Middle layers: alternate between buf_a and buf_b
+        var i: usize = 1;
+        while (i < n - 1) : (i += 1) {
+            if (i % 2 == 1) {
+                // buf_a -> buf_b
+                try self.layers[i].forward(&buf_a, &buf_b, allocator);
+            } else {
+                // buf_b -> buf_a
+                try self.layers[i].forward(&buf_b, &buf_a, allocator);
+            }
+        }
+
+        // Last layer: write to output
+        const last_idx = n - 1;
+        if (last_idx % 2 == 1) {
+            // Previous wrote to buf_a (odd index reads from buf_a)
+            try self.layers[last_idx].forward(&buf_a, output, allocator);
+        } else {
+            // Previous wrote to buf_b (even index reads from buf_b)
+            try self.layers[last_idx].forward(&buf_b, output, allocator);
+        }
+    }
+};
+
+// ── ParallelLayer ────────────────────────────────────────────────────────────
+//
+// Runs all child layers on the SAME input in parallel and concatenates their
+// outputs along the feature dimension. The output has width equal to the
+// input width and num_features equal to the sum of all children's output
+// feature counts.
+
+pub const ParallelLayer = struct {
+    layers: []Layer,
+    ni: usize, // input features (same for all children)
+    no: usize, // output features = sum of all children's outputs
+    allocator: std.mem.Allocator,
+
+    /// Allocate a ParallelLayer on the heap. Copies the provided layers slice.
+    /// Computes no as the sum of all children's numOutputs().
+    pub fn init(allocator: std.mem.Allocator, layers: []const Layer) !*ParallelLayer {
+        const owned_layers = try allocator.alloc(Layer, layers.len);
+        @memcpy(owned_layers, layers);
+
+        const ni: usize = if (layers.len > 0) switch (layers[0]) {
+            .fully_connected => |fc| fc.ni,
+            .lstm => |l| l.ni,
+            .series => |s| s.ni,
+            .parallel => |p| p.ni,
+        } else 0;
+
+        var no: usize = 0;
+        for (layers) |layer| {
+            no += layer.numOutputs();
+        }
+
+        const self = try allocator.create(ParallelLayer);
+        self.* = ParallelLayer{
+            .layers = owned_layers,
+            .ni = ni,
+            .no = no,
+            .allocator = allocator,
+        };
+        return self;
+    }
+
+    /// Free the layers slice and the ParallelLayer itself.
+    pub fn deinit(self: *ParallelLayer) void {
+        self.allocator.free(self.layers);
+        self.allocator.destroy(self);
+    }
+
+    /// Forward pass: run each child on the input, concatenate outputs.
+    /// Output shape: [input.width()][self.no]
+    /// Features are laid out as: child_0 features, then child_1 features, etc.
+    pub fn forward(self: *ParallelLayer, input: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) ForwardError!void {
+        const w = input.width();
+        try output.resize(w, self.no);
+
+        var temp = try NetworkIO.init(allocator, 1, 1, false);
+        defer temp.deinit();
+
+        // Temp buffer to read one timestep from the child output.
+        const max_child_outputs = blk: {
+            var m: usize = 0;
+            for (self.layers) |layer| {
+                const co = layer.numOutputs();
+                if (co > m) m = co;
+            }
+            break :blk m;
+        };
+        const ts_buf = try allocator.alloc(f32, max_child_outputs);
+        defer allocator.free(ts_buf);
+
+        var offset: usize = 0;
+        for (self.layers) |*layer| {
+            try layer.forward(input, &temp, allocator);
+
+            const child_no = layer.numOutputs();
+
+            // Copy each timestep's features into the correct offset in output
+            for (0..w) |t| {
+                temp.readTimeStep(t, ts_buf[0..child_no]);
+
+                // Write into the output at the correct feature offset
+                const out_slice = output.f_data.?;
+                const out_offset = t * self.no + offset;
+                @memcpy(out_slice[out_offset .. out_offset + child_no], ts_buf[0..child_no]);
+            }
+
+            offset += child_no;
+        }
+    }
+};
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 test "NetworkIO create and read/write timestep (float)" {
@@ -948,4 +1174,201 @@ test "LSTM output dimensions correct" {
     // Verify output dimensions: width=10, features=3
     try std.testing.expectEqual(@as(usize, 10), output.width());
     try std.testing.expectEqual(@as(usize, 3), output.numFeatures());
+}
+
+// ── Series / Parallel / Layer Union Tests ────────────────────────────────────
+
+test "SeriesLayer chains two FC layers" {
+    const allocator = std.testing.allocator;
+
+    // FC1: 3 inputs -> 2 outputs (linear)
+    // Weights: each output = sum of all inputs
+    //   Row 0: [1, 1, 1, bias=0] -> out0 = x0 + x1 + x2
+    //   Row 1: [1, 1, 1, bias=0] -> out1 = x0 + x1 + x2
+    var fc1 = try FullyConnectedLayer.init(allocator, 3, 2, .linear);
+    defer fc1.deinit(allocator);
+    fc1.weights.set(0, 0, 1.0);
+    fc1.weights.set(0, 1, 1.0);
+    fc1.weights.set(0, 2, 1.0);
+    fc1.weights.setBias(0, 0.0);
+    fc1.weights.set(1, 0, 1.0);
+    fc1.weights.set(1, 1, 1.0);
+    fc1.weights.set(1, 2, 1.0);
+    fc1.weights.setBias(1, 0.0);
+
+    // FC2: 2 inputs -> 1 output (linear)
+    // Weight: out = sum of both inputs
+    //   Row 0: [1, 1, bias=0] -> out0 = y0 + y1
+    var fc2 = try FullyConnectedLayer.init(allocator, 2, 1, .linear);
+    defer fc2.deinit(allocator);
+    fc2.weights.set(0, 0, 1.0);
+    fc2.weights.set(0, 1, 1.0);
+    fc2.weights.setBias(0, 0.0);
+
+    // Series(FC1, FC2): 3 inputs -> 1 output
+    const child_layers = [_]Layer{
+        Layer{ .fully_connected = fc1 },
+        Layer{ .fully_connected = fc2 },
+    };
+    const series = try SeriesLayer.init(allocator, &child_layers);
+    defer series.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), series.ni);
+    try std.testing.expectEqual(@as(usize, 1), series.no);
+
+    // Input: 1 timestep, [1.0, 2.0, 3.0]
+    var input = try NetworkIO.init(allocator, 1, 3, false);
+    defer input.deinit();
+    const t0_in = [_]f32{ 1.0, 2.0, 3.0 };
+    input.writeTimeStep(0, &t0_in);
+
+    var output = try NetworkIO.init(allocator, 1, 1, false);
+    defer output.deinit();
+
+    try series.forward(&input, &output, allocator);
+
+    // FC1: each output = 1+2+3 = 6 -> [6, 6]
+    // FC2: output = 6+6 = 12 -> [12]
+    var out: [1]f32 = undefined;
+    output.readTimeStep(0, &out);
+
+    const tol: f32 = 1e-5;
+    try std.testing.expectApproxEqAbs(@as(f32, 12.0), out[0], tol);
+}
+
+test "ParallelLayer concatenates outputs" {
+    const allocator = std.testing.allocator;
+
+    // FC1: 2 inputs -> 1 output (linear), picks input[0]
+    //   Row 0: [1, 0, bias=0]
+    var fc1 = try FullyConnectedLayer.init(allocator, 2, 1, .linear);
+    defer fc1.deinit(allocator);
+    fc1.weights.set(0, 0, 1.0);
+    fc1.weights.set(0, 1, 0.0);
+    fc1.weights.setBias(0, 0.0);
+
+    // FC2: 2 inputs -> 1 output (linear), picks input[1]
+    //   Row 0: [0, 1, bias=0]
+    var fc2 = try FullyConnectedLayer.init(allocator, 2, 1, .linear);
+    defer fc2.deinit(allocator);
+    fc2.weights.set(0, 0, 0.0);
+    fc2.weights.set(0, 1, 1.0);
+    fc2.weights.setBias(0, 0.0);
+
+    // Parallel(FC1, FC2): 2 inputs -> 2 outputs (concatenated)
+    const child_layers = [_]Layer{
+        Layer{ .fully_connected = fc1 },
+        Layer{ .fully_connected = fc2 },
+    };
+    const parallel = try ParallelLayer.init(allocator, &child_layers);
+    defer parallel.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), parallel.ni);
+    try std.testing.expectEqual(@as(usize, 2), parallel.no);
+
+    // Input: 1 timestep, [3.0, 7.0]
+    var input = try NetworkIO.init(allocator, 1, 2, false);
+    defer input.deinit();
+    const t0_in = [_]f32{ 3.0, 7.0 };
+    input.writeTimeStep(0, &t0_in);
+
+    var output = try NetworkIO.init(allocator, 1, 1, false);
+    defer output.deinit();
+
+    try parallel.forward(&input, &output, allocator);
+
+    // FC1 picks input[0]=3.0, FC2 picks input[1]=7.0
+    // Output: [3.0, 7.0] (concatenated)
+    try std.testing.expectEqual(@as(usize, 1), output.width());
+    try std.testing.expectEqual(@as(usize, 2), output.numFeatures());
+
+    var out: [2]f32 = undefined;
+    output.readTimeStep(0, &out);
+
+    const tol: f32 = 1e-5;
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), out[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), out[1], tol);
+}
+
+test "SeriesLayer single layer passthrough" {
+    const allocator = std.testing.allocator;
+
+    // FC: 2 inputs -> 2 outputs (linear), identity + bias
+    //   Row 0: [1, 0, bias=0.5]
+    //   Row 1: [0, 1, bias=-1.0]
+    var fc = try FullyConnectedLayer.init(allocator, 2, 2, .linear);
+    defer fc.deinit(allocator);
+    fc.weights.set(0, 0, 1.0);
+    fc.weights.set(0, 1, 0.0);
+    fc.weights.setBias(0, 0.5);
+    fc.weights.set(1, 0, 0.0);
+    fc.weights.set(1, 1, 1.0);
+    fc.weights.setBias(1, -1.0);
+
+    // Series with 1 layer
+    const child_layers = [_]Layer{Layer{ .fully_connected = fc }};
+    const series = try SeriesLayer.init(allocator, &child_layers);
+    defer series.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), series.ni);
+    try std.testing.expectEqual(@as(usize, 2), series.no);
+
+    // Input: 1 timestep, [3.0, 7.0]
+    var input = try NetworkIO.init(allocator, 1, 2, false);
+    defer input.deinit();
+    const t0_in = [_]f32{ 3.0, 7.0 };
+    input.writeTimeStep(0, &t0_in);
+
+    var output = try NetworkIO.init(allocator, 1, 1, false);
+    defer output.deinit();
+
+    try series.forward(&input, &output, allocator);
+
+    // Expected: [3.0+0.5, 7.0-1.0] = [3.5, 6.0]
+    var out: [2]f32 = undefined;
+    output.readTimeStep(0, &out);
+
+    const tol: f32 = 1e-5;
+    try std.testing.expectApproxEqAbs(@as(f32, 3.5), out[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), out[1], tol);
+}
+
+test "Layer union dispatches correctly" {
+    const allocator = std.testing.allocator;
+
+    // Create a FullyConnected layer: 2 inputs -> 1 output, linear
+    //   Row 0: [1, 1, bias=0] -> sum of inputs
+    var fc = try FullyConnectedLayer.init(allocator, 2, 1, .linear);
+    defer fc.deinit(allocator);
+    fc.weights.set(0, 0, 1.0);
+    fc.weights.set(0, 1, 1.0);
+    fc.weights.setBias(0, 0.0);
+
+    // Wrap in a Layer union
+    var layer = Layer{ .fully_connected = fc };
+
+    // Input: 1 timestep, [5.0, 3.0]
+    var input = try NetworkIO.init(allocator, 1, 2, false);
+    defer input.deinit();
+    const t0_in = [_]f32{ 5.0, 3.0 };
+    input.writeTimeStep(0, &t0_in);
+
+    var output = try NetworkIO.init(allocator, 1, 1, false);
+    defer output.deinit();
+
+    // Call forward through the Layer union dispatch
+    try layer.forward(&input, &output, allocator);
+
+    // Expected: 5.0 + 3.0 = 8.0
+    try std.testing.expectEqual(@as(usize, 1), output.width());
+    try std.testing.expectEqual(@as(usize, 1), output.numFeatures());
+
+    var out: [1]f32 = undefined;
+    output.readTimeStep(0, &out);
+
+    const tol: f32 = 1e-5;
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0), out[0], tol);
+
+    // Verify numOutputs dispatch
+    try std.testing.expectEqual(@as(usize, 1), layer.numOutputs());
 }
