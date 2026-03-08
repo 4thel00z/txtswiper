@@ -7,6 +7,7 @@ pub const activations = @import("activations.zig");
 pub const weights = @import("weights.zig");
 pub const network = @import("network.zig");
 pub const tessdata = @import("tessdata.zig");
+pub const recognizer = @import("recognizer.zig");
 
 /// Load an image from a file path. Returns pixel data and image dimensions.
 /// Caller owns the returned pixel slice and must free it with `stbiFree`.
@@ -41,4 +42,5 @@ test {
     _ = weights;
     _ = network;
     _ = tessdata;
+    _ = recognizer;
 }
