@@ -42,6 +42,13 @@ pub const BinaryReader = struct {
         return val;
     }
 
+    pub fn readF32(self: *BinaryReader) !f32 {
+        if (self.pos + 4 > self.data.len) return error.UnexpectedEof;
+        const val = @as(f32, @bitCast(std.mem.readInt(u32, self.data[self.pos..][0..4], .little)));
+        self.pos += 4;
+        return val;
+    }
+
     pub fn readF64(self: *BinaryReader) !f64 {
         if (self.pos + 8 > self.data.len) return error.UnexpectedEof;
         const val = @as(f64, @bitCast(std.mem.readInt(u64, self.data[self.pos..][0..8], .little)));

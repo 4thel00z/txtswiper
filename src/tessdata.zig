@@ -1,4 +1,6 @@
 const std = @import("std");
+const network_mod = @import("network.zig");
+const weights_mod = @import("weights.zig");
 
 // ── TessdataType ─────────────────────────────────────────────────────────────
 
@@ -751,6 +753,285 @@ pub const SquishedDawg = struct {
     }
 };
 
+// ── UnicharCompress ──────────────────────────────────────────────────────────
+
+/// Training flag: model uses int8 quantized weights.
+const TF_INT_MODE: i32 = 0x01;
+/// Training flag: model has a compressed unicharset recoder.
+const TF_COMPRESS_UNICHARSET: i32 = 0x40;
+
+/// Recoder: maps UNICHARSET character IDs to network output codes.
+/// In Tesseract, the recoder compresses the unicharset so that the network
+/// output layer can be smaller than the full unicharset. Each unichar_id maps
+/// to a short sequence of code values (a RecodedCharID).
+pub const UnicharCompress = struct {
+    entries: []RecodedCharID,
+    allocator: std.mem.Allocator,
+
+    pub const RecodedCharID = struct {
+        self_normalized: bool,
+        codes: []i32, // encoded character code sequence
+    };
+
+    /// Deserialize the recoder from the TESSDATA_LSTM component stream.
+    /// Format: u32 entry_count, then for each entry:
+    ///   i8 self_normalized, i32 length (0-9), i32[length] code values
+    pub fn load(allocator: std.mem.Allocator, reader: *weights_mod.BinaryReader) !UnicharCompress {
+        const entry_count = reader.readU32() catch return error.UnexpectedEof;
+
+        const entries = allocator.alloc(RecodedCharID, entry_count) catch return error.OutOfMemory;
+        var populated: u32 = 0;
+        errdefer {
+            for (entries[0..populated]) |*e| {
+                if (e.codes.len > 0) allocator.free(e.codes);
+            }
+            allocator.free(entries);
+        }
+
+        for (0..entry_count) |i| {
+            const self_norm_i8 = reader.readI8() catch return error.UnexpectedEof;
+            const length = reader.readI32() catch return error.UnexpectedEof;
+            if (length < 0 or length > 9) return error.InvalidRecoderEntry;
+
+            const len: usize = @intCast(length);
+            const codes = allocator.alloc(i32, len) catch return error.OutOfMemory;
+            errdefer allocator.free(codes);
+
+            for (0..len) |c| {
+                codes[c] = reader.readI32() catch return error.UnexpectedEof;
+            }
+
+            entries[i] = RecodedCharID{
+                .self_normalized = self_norm_i8 != 0,
+                .codes = codes,
+            };
+            populated += 1;
+        }
+
+        return UnicharCompress{
+            .entries = entries,
+            .allocator = allocator,
+        };
+    }
+
+    /// Release all owned memory.
+    pub fn deinit(self: *UnicharCompress) void {
+        for (self.entries) |*e| {
+            if (e.codes.len > 0) self.allocator.free(e.codes);
+        }
+        self.allocator.free(self.entries);
+        self.entries = &.{};
+    }
+
+    /// Encode a unichar_id to its recoded form.
+    /// Returns null if the id is out of range.
+    pub fn encode(self: UnicharCompress, unichar_id: u32) ?[]const i32 {
+        if (unichar_id >= self.entries.len) return null;
+        return self.entries[unichar_id].codes;
+    }
+
+    /// Number of entries.
+    pub fn size(self: UnicharCompress) usize {
+        return self.entries.len;
+    }
+};
+
+// ── LSTMRecognizer ──────────────────────────────────────────────────────────
+
+/// Errors specific to LSTMRecognizer loading.
+pub const RecognizerError = error{
+    /// The TESSDATA_LSTM component is missing from the .traineddata file.
+    MissingLSTMComponent,
+    /// The TESSDATA_LSTM_UNICHARSET component is missing.
+    MissingUnicharset,
+    /// A recoder entry has an invalid length (not 0-9).
+    InvalidRecoderEntry,
+    /// Network deserialization failed.
+    NetworkDeserializeFailed,
+    /// Unexpected end of data in the LSTM component.
+    UnexpectedEof,
+    /// Memory allocation failed.
+    OutOfMemory,
+};
+
+/// Complete LSTM model ready for inference.
+/// Ties together: network graph, unicharset, recoder, dictionaries, and params.
+pub const LSTMRecognizer = struct {
+    // Core components
+    network: network_mod.Layer, // The neural network graph
+    unicharset: Unicharset, // Character set
+
+    // Recoder (maps unicharset IDs -> network output codes)
+    recoder: ?UnicharCompress, // null if not compressed
+
+    // Training metadata (useful for inference config)
+    network_str: []const u8, // Network spec string
+    training_flags: i32,
+    null_char: i32, // Blank/CTC null character index
+
+    // Optional dictionaries
+    punc_dawg: ?SquishedDawg,
+    system_dawg: ?SquishedDawg,
+    number_dawg: ?SquishedDawg,
+
+    allocator: std.mem.Allocator,
+
+    /// Load complete model from .traineddata file data.
+    pub fn load(allocator: std.mem.Allocator, traineddata: []const u8) !LSTMRecognizer {
+        // 1. Parse the container
+        const mgr = TessdataManager.init(traineddata) catch
+            return error.MissingLSTMComponent;
+
+        // 2. Get the LSTM component
+        const lstm_data = mgr.getComponent(.lstm) orelse
+            return error.MissingLSTMComponent;
+
+        // 3. Create a reader over the LSTM component
+        var reader = weights_mod.BinaryReader.init(lstm_data);
+
+        // 4. Deserialize the network graph
+        var net = network_mod.deserializeNetwork(allocator, &reader) catch
+            return error.NetworkDeserializeFailed;
+        errdefer network_mod.deinitLayer(allocator, &net);
+
+        // 5. Read network_str (spec string)
+        const net_str = reader.readString(allocator) catch
+            return error.UnexpectedEof;
+        errdefer allocator.free(net_str);
+
+        // 6. Read training_flags
+        const training_flags = reader.readI32() catch return error.UnexpectedEof;
+
+        // 7. Read training_iteration (consumed, not stored)
+        _ = reader.readI32() catch return error.UnexpectedEof;
+
+        // 8. Read sample_iteration (consumed, not stored)
+        _ = reader.readI32() catch return error.UnexpectedEof;
+
+        // 9. Read null_char
+        const null_char = reader.readI32() catch return error.UnexpectedEof;
+
+        // 10. Read adam_beta (consumed, not stored)
+        _ = reader.readF32() catch return error.UnexpectedEof;
+
+        // 11. Read learning_rate (consumed, not stored)
+        _ = reader.readF32() catch return error.UnexpectedEof;
+
+        // 12. Read momentum (consumed, not stored)
+        _ = reader.readF32() catch return error.UnexpectedEof;
+
+        // 13-14. Load unicharset and recoder.
+        // Modern .traineddata files have separate TESSDATA_LSTM_UNICHARSET and
+        // TESSDATA_LSTM_RECODER components. Older files embed them inline in
+        // the LSTM component stream. We detect which format by checking if the
+        // separate components exist (matching Tesseract's include_charsets logic).
+        const has_separate_charsets = mgr.hasComponent(.lstm_unicharset) and
+            mgr.hasComponent(.lstm_recoder);
+
+        var unicharset: Unicharset = undefined;
+        var recoder: ?UnicharCompress = null;
+        errdefer {
+            if (recoder) |*r| r.deinit();
+        }
+
+        if (has_separate_charsets) {
+            // Modern format: charsets are in separate components.
+            // The LSTM stream ends after momentum (no inline unicharset/recoder).
+            const unicharset_data = mgr.getComponent(.lstm_unicharset).?;
+            unicharset = Unicharset.load(allocator, unicharset_data) catch
+                return error.OutOfMemory;
+
+            if ((training_flags & TF_COMPRESS_UNICHARSET) != 0) {
+                const recoder_data = mgr.getComponent(.lstm_recoder).?;
+                var recoder_reader = weights_mod.BinaryReader.init(recoder_data);
+                recoder = UnicharCompress.load(allocator, &recoder_reader) catch
+                    return error.UnexpectedEof;
+            }
+        } else {
+            // Legacy format: unicharset was inline (already consumed by network
+            // deserializer or needs to be read here). For now we only support
+            // models with separate components.
+            if (mgr.getComponent(.lstm_unicharset)) |unicharset_data| {
+                unicharset = Unicharset.load(allocator, unicharset_data) catch
+                    return error.OutOfMemory;
+            } else {
+                return error.MissingUnicharset;
+            }
+
+            // Inline recoder follows momentum in the LSTM stream.
+            if ((training_flags & TF_COMPRESS_UNICHARSET) != 0) {
+                recoder = UnicharCompress.load(allocator, &reader) catch
+                    return error.UnexpectedEof;
+            }
+        }
+        errdefer unicharset.deinit();
+
+        // 15-17. Load optional DAWG dictionaries
+        var punc_dawg: ?SquishedDawg = null;
+        errdefer {
+            if (punc_dawg) |*d| d.deinit();
+        }
+        if (mgr.getComponent(.lstm_punc_dawg)) |dawg_data| {
+            punc_dawg = SquishedDawg.load(allocator, dawg_data) catch null;
+        }
+
+        var system_dawg: ?SquishedDawg = null;
+        errdefer {
+            if (system_dawg) |*d| d.deinit();
+        }
+        if (mgr.getComponent(.lstm_system_dawg)) |dawg_data| {
+            system_dawg = SquishedDawg.load(allocator, dawg_data) catch null;
+        }
+
+        var number_dawg: ?SquishedDawg = null;
+        errdefer {
+            if (number_dawg) |*d| d.deinit();
+        }
+        if (mgr.getComponent(.lstm_number_dawg)) |dawg_data| {
+            number_dawg = SquishedDawg.load(allocator, dawg_data) catch null;
+        }
+
+        return LSTMRecognizer{
+            .network = net,
+            .unicharset = unicharset,
+            .recoder = recoder,
+            .network_str = net_str,
+            .training_flags = training_flags,
+            .null_char = null_char,
+            .punc_dawg = punc_dawg,
+            .system_dawg = system_dawg,
+            .number_dawg = number_dawg,
+            .allocator = allocator,
+        };
+    }
+
+    /// Free all resources.
+    pub fn deinit(self: *LSTMRecognizer) void {
+        network_mod.deinitLayer(self.allocator, &self.network);
+        self.unicharset.deinit();
+        if (self.recoder) |*r| r.deinit();
+        self.allocator.free(self.network_str);
+        if (self.punc_dawg) |*d| d.deinit();
+        if (self.system_dawg) |*d| d.deinit();
+        if (self.number_dawg) |*d| d.deinit();
+    }
+
+    /// Number of output classes (from network's output layer).
+    pub fn numClasses(self: LSTMRecognizer) usize {
+        return self.network.numOutputs();
+    }
+
+    /// Number of input features (from network's input layer).
+    pub fn numInputs(self: LSTMRecognizer) usize {
+        return self.network.numInputs();
+    }
+
+    /// Whether the model uses int8 quantized weights.
+    pub fn isIntMode(self: LSTMRecognizer) bool {
+        return (self.training_flags & TF_INT_MODE) != 0;
+    }
+};
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 test "parse eng.traineddata from file" {
@@ -1459,4 +1740,110 @@ test "SquishedDawg load from eng.traineddata" {
         // Verify node 0 has forward edges for binary search.
         try std.testing.expect(sys_dawg.num_forward_edges_in_node0 > 0);
     }
+}
+
+// ── LSTMRecognizer Tests ────────────────────────────────────────────────────
+
+test "LSTMRecognizer load complete eng.traineddata model" {
+    const allocator = std.testing.allocator;
+
+    const file = std.fs.cwd().openFile("test/testdata/eng.traineddata", .{}) catch |err| {
+        std.debug.print("Skipping test: cannot open test file: {}\n", .{err});
+        return;
+    };
+    defer file.close();
+
+    const data = file.readToEndAlloc(allocator, 16 * 1024 * 1024) catch |err| {
+        std.debug.print("Skipping test: cannot read test file: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(data);
+
+    var model = try LSTMRecognizer.load(allocator, data);
+    defer model.deinit();
+
+    // 1. Verify network loaded (it's a Series)
+    try std.testing.expect(model.network == .series);
+
+    // 2. Verify unicharset has 112 chars
+    try std.testing.expectEqual(@as(usize, 112), model.unicharset.size());
+
+    // 3. Verify null_char is a valid index (within unicharset range)
+    try std.testing.expect(model.null_char >= 0);
+    try std.testing.expect(@as(usize, @intCast(model.null_char)) < model.unicharset.size());
+
+    // 4. Verify recoder loaded (eng model has TF_COMPRESS_UNICHARSET)
+    try std.testing.expect(model.recoder != null);
+    if (model.recoder) |recoder| {
+        try std.testing.expect(recoder.size() > 0);
+        // The recoder should have entries for all unicharset chars
+        try std.testing.expectEqual(@as(usize, 112), recoder.size());
+    }
+
+    // 5. Verify at least one DAWG loaded
+    const has_dawg = model.punc_dawg != null or model.system_dawg != null or model.number_dawg != null;
+    try std.testing.expect(has_dawg);
+
+    // All three should be present for eng
+    try std.testing.expect(model.punc_dawg != null);
+    try std.testing.expect(model.system_dawg != null);
+    try std.testing.expect(model.number_dawg != null);
+
+    // 6. Verify numClasses() returns reasonable number (~111 for eng)
+    const num_classes = model.numClasses();
+    try std.testing.expect(num_classes > 50);
+    try std.testing.expect(num_classes < 500);
+
+    // 7. Verify numInputs() is reasonable
+    const num_inputs = model.numInputs();
+    try std.testing.expect(num_inputs > 0);
+}
+
+test "LSTMRecognizer network_str starts with '['" {
+    const allocator = std.testing.allocator;
+
+    const file = std.fs.cwd().openFile("test/testdata/eng.traineddata", .{}) catch |err| {
+        std.debug.print("Skipping test: cannot open test file: {}\n", .{err});
+        return;
+    };
+    defer file.close();
+
+    const data = file.readToEndAlloc(allocator, 16 * 1024 * 1024) catch |err| {
+        std.debug.print("Skipping test: cannot read test file: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(data);
+
+    var model = try LSTMRecognizer.load(allocator, data);
+    defer model.deinit();
+
+    // The network_str is a spec string like "[1,1,0,1 Ct5,5,16 Mp3,3..."
+    try std.testing.expect(model.network_str.len > 0);
+    try std.testing.expectEqual(@as(u8, '['), model.network_str[0]);
+}
+
+test "LSTMRecognizer training_flags has TF_INT_MODE set" {
+    const allocator = std.testing.allocator;
+
+    const file = std.fs.cwd().openFile("test/testdata/eng.traineddata", .{}) catch |err| {
+        std.debug.print("Skipping test: cannot open test file: {}\n", .{err});
+        return;
+    };
+    defer file.close();
+
+    const data = file.readToEndAlloc(allocator, 16 * 1024 * 1024) catch |err| {
+        std.debug.print("Skipping test: cannot read test file: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(data);
+
+    var model = try LSTMRecognizer.load(allocator, data);
+    defer model.deinit();
+
+    // eng model uses int8 quantized weights
+    try std.testing.expect(model.isIntMode());
+    try std.testing.expect((model.training_flags & TF_INT_MODE) != 0);
+
+    // eng model should also have TF_COMPRESS_UNICHARSET
+    try std.testing.expect((model.training_flags & TF_COMPRESS_UNICHARSET) != 0);
 }
