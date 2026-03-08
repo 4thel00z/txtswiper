@@ -419,6 +419,338 @@ pub const Unicharset = struct {
     }
 };
 
+// ── SquishedDawg ────────────────────────────────────────────────────────────
+
+/// Errors specific to DAWG loading.
+pub const DawgError = error{
+    /// Magic number is not 42 (kDawgMagicNumber).
+    BadMagicNumber,
+    /// Data is too small to contain a valid DAWG header.
+    DataTooSmall,
+    /// The unicharset_size value is invalid (<= 0).
+    BadUnicharsetSize,
+    /// The num_edges value is invalid (<= 0).
+    BadEdgeCount,
+    /// The data is too small to hold all declared edges.
+    TruncatedEdges,
+    /// Memory allocation failed.
+    OutOfMemory,
+};
+
+/// Magic number written at the start of a serialised DAWG.
+const kDawgMagicNumber: i16 = 42;
+
+/// Sentinel value meaning "no edge found".
+const NO_EDGE: u64 = 0xFFFFFFFFFFFFFFFF;
+
+/// Flag bit offsets within the 3-bit flags field.
+const MARKER_FLAG: u64 = 1; // bit 0
+const DIRECTION_FLAG: u64 = 2; // bit 1
+const WERD_END_FLAG: u64 = 4; // bit 2
+
+/// Number of flag bits packed into each edge record.
+const NUM_FLAG_BITS: u6 = 3;
+
+/// Parses and queries a Squished DAWG (Directed Acyclic Word Graph) used by
+/// Tesseract OCR for dictionary-based word validation during beam search.
+///
+/// The DAWG stores words as paths through a graph of edges. Each edge is
+/// packed into a u64 record containing a unichar ID, flags, and a pointer
+/// to the next node. Node 0 (the root) has its edges sorted by unichar ID
+/// for binary search; all other nodes use linear search.
+///
+/// Three DAWG types are used for LSTM inference:
+///   - `lstm_punc_dawg` (punctuation patterns)
+///   - `lstm_system_dawg` (system dictionary / word list)
+///   - `lstm_number_dawg` (number patterns)
+pub const SquishedDawg = struct {
+    /// Flat array of edge records. Nodes are implicit: a node starts at a
+    /// given index and its edges are consecutive until MARKER_FLAG is set.
+    edges: []u64,
+    unicharset_size: u32,
+
+    // Computed bit masks derived from unicharset_size.
+    letter_mask: u64,
+    flags_mask: u64,
+    next_node_mask: u64,
+    flag_start_bit: u6,
+    next_node_start_bit: u6,
+
+    /// Number of forward edges in node 0 (for binary search bounds).
+    num_forward_edges_in_node0: u64,
+
+    allocator: std.mem.Allocator,
+
+    /// Parse a SquishedDawg from raw binary data (as returned by
+    /// TessdataManager.getComponent).
+    ///
+    /// Binary layout:
+    ///   i16: magic number (42)
+    ///   i32: unicharset_size
+    ///   i32: num_edges
+    ///   u64[num_edges]: edge records
+    pub fn load(allocator: std.mem.Allocator, data: []const u8) DawgError!SquishedDawg {
+        // Minimum size: 2 (magic) + 4 (unicharset_size) + 4 (num_edges) = 10
+        if (data.len < 10) return DawgError.DataTooSmall;
+
+        // Read magic number (i16, little-endian).
+        const magic = std.mem.readInt(i16, data[0..2], .little);
+        if (magic != kDawgMagicNumber) return DawgError.BadMagicNumber;
+
+        // Read unicharset_size (i32, little-endian).
+        const uc_size_i32 = std.mem.readInt(i32, data[2..6], .little);
+        if (uc_size_i32 <= 0) return DawgError.BadUnicharsetSize;
+        const uc_size: u32 = @intCast(uc_size_i32);
+
+        // Read num_edges (i32, little-endian).
+        const num_edges_i32 = std.mem.readInt(i32, data[6..10], .little);
+        if (num_edges_i32 <= 0) return DawgError.BadEdgeCount;
+        const num_edges: u32 = @intCast(num_edges_i32);
+
+        // Check there is enough data for all edges.
+        const edge_data_size: usize = @as(usize, num_edges) * 8;
+        if (data.len < 10 + edge_data_size) return DawgError.TruncatedEdges;
+
+        // Compute bit layout from unicharset_size.
+        // flag_start_bit = ceil(log2(unicharset_size + 1))
+        const flag_start_bit = computeFlagStartBit(uc_size);
+        const next_node_start_bit: u6 = flag_start_bit + NUM_FLAG_BITS;
+
+        const letter_mask: u64 = if (flag_start_bit >= 64) ~@as(u64, 0) else (@as(u64, 1) << flag_start_bit) -% 1;
+        const next_node_mask: u64 = if (next_node_start_bit >= 64) 0 else ~@as(u64, 0) << next_node_start_bit;
+        const flags_mask: u64 = ~(letter_mask | next_node_mask);
+
+        // Allocate and copy edge records.
+        const edges = allocator.alloc(u64, num_edges) catch return DawgError.OutOfMemory;
+        errdefer allocator.free(edges);
+
+        const edge_bytes = data[10 .. 10 + edge_data_size];
+        for (0..num_edges) |i| {
+            const start = i * 8;
+            edges[i] = std.mem.readInt(u64, edge_bytes[start..][0..8], .little);
+        }
+
+        // Count forward edges in node 0.
+        var dawg = SquishedDawg{
+            .edges = edges,
+            .unicharset_size = uc_size,
+            .letter_mask = letter_mask,
+            .flags_mask = flags_mask,
+            .next_node_mask = next_node_mask,
+            .flag_start_bit = flag_start_bit,
+            .next_node_start_bit = next_node_start_bit,
+            .num_forward_edges_in_node0 = 0,
+            .allocator = allocator,
+        };
+
+        dawg.num_forward_edges_in_node0 = dawg.countForwardEdges(0);
+
+        return dawg;
+    }
+
+    /// Release all owned memory.
+    pub fn deinit(self: *SquishedDawg) void {
+        self.allocator.free(self.edges);
+        self.edges = &.{};
+    }
+
+    // ── Edge accessors ──────────────────────────────────────────────────
+
+    /// Extract the UNICHAR_ID from an edge record.
+    pub fn unicharId(self: SquishedDawg, edge: u64) u32 {
+        return @intCast(edge & self.letter_mask);
+    }
+
+    /// Extract the next-node index from an edge record.
+    pub fn nextNode(self: SquishedDawg, edge: u64) u64 {
+        return (edge & self.next_node_mask) >> self.next_node_start_bit;
+    }
+
+    /// Returns true if this edge has the MARKER_FLAG set (last edge in node).
+    pub fn isMarkerFlag(self: SquishedDawg, edge: u64) bool {
+        return (edge & (MARKER_FLAG << self.flag_start_bit)) != 0;
+    }
+
+    /// Returns true if this edge has the DIRECTION_FLAG set (backward edge).
+    pub fn isBackwardEdge(self: SquishedDawg, edge: u64) bool {
+        return (edge & (DIRECTION_FLAG << self.flag_start_bit)) != 0;
+    }
+
+    /// Returns true if this edge has the WERD_END_FLAG set (word boundary).
+    pub fn isWordEnd(self: SquishedDawg, edge: u64) bool {
+        return (edge & (WERD_END_FLAG << self.flag_start_bit)) != 0;
+    }
+
+    /// Returns true if the edge slot is occupied (not an empty edge).
+    /// An empty edge has the value next_node_mask (all next-node bits set,
+    /// everything else zero).
+    fn isEdgeOccupied(self: SquishedDawg, edge_ref: u64) bool {
+        if (edge_ref >= self.edges.len) return false;
+        return self.edges[@intCast(edge_ref)] != self.next_node_mask;
+    }
+
+    /// Returns true if this is a forward edge (occupied and direction = 0).
+    fn isForwardEdge(self: SquishedDawg, edge_ref: u64) bool {
+        if (!self.isEdgeOccupied(edge_ref)) return false;
+        return !self.isBackwardEdge(self.edges[@intCast(edge_ref)]);
+    }
+
+    // ── Lookup ──────────────────────────────────────────────────────────
+
+    /// Find an edge out of `node` with matching `unichar_id`.
+    /// If `require_word_end` is true, the edge must also have WERD_END_FLAG.
+    /// Returns the edge index, or null if not found.
+    ///
+    /// For node 0: uses binary search (edges sorted by unichar_id).
+    /// For other nodes: linear scan until MARKER_FLAG.
+    pub fn edgeCharOf(self: SquishedDawg, node: u64, unichar_id: u32, require_word_end: bool) ?u64 {
+        if (node == 0) {
+            // Binary search within the forward edges of node 0.
+            if (self.num_forward_edges_in_node0 == 0) return null;
+            var start: i64 = 0;
+            var end: i64 = @as(i64, @intCast(self.num_forward_edges_in_node0)) - 1;
+
+            while (start <= end) {
+                const mid_idx: u64 = @intCast(@divTrunc(start + end, 2));
+                const rec = self.edges[@intCast(mid_idx)];
+                const edge_uid = self.unicharId(rec);
+
+                if (unichar_id == edge_uid) {
+                    // Unichar matches. Check word_end requirement.
+                    if (!require_word_end or self.isWordEnd(rec)) {
+                        return mid_idx;
+                    }
+                    // In Tesseract's binary search, if unichar matches but
+                    // word_end doesn't, the comparison logic treats the query
+                    // as "greater" so it searches right. But for simplicity,
+                    // since there's typically only one edge per unichar_id in
+                    // node 0, we do a linear scan around mid.
+                    // Search left from mid for a match.
+                    var probe: i64 = @as(i64, @intCast(mid_idx)) - 1;
+                    while (probe >= 0) {
+                        const prec = self.edges[@intCast(@as(u64, @intCast(probe)))];
+                        if (self.unicharId(prec) != unichar_id) break;
+                        if (!require_word_end or self.isWordEnd(prec)) {
+                            return @intCast(@as(u64, @intCast(probe)));
+                        }
+                        probe -= 1;
+                    }
+                    // Search right from mid.
+                    var probe_r: u64 = mid_idx + 1;
+                    while (probe_r < self.num_forward_edges_in_node0) {
+                        const prec = self.edges[@intCast(probe_r)];
+                        if (self.unicharId(prec) != unichar_id) break;
+                        if (!require_word_end or self.isWordEnd(prec)) {
+                            return probe_r;
+                        }
+                        probe_r += 1;
+                    }
+                    return null;
+                } else if (unichar_id > edge_uid) {
+                    start = @as(i64, @intCast(mid_idx)) + 1;
+                } else {
+                    end = @as(i64, @intCast(mid_idx)) - 1;
+                }
+            }
+            return null;
+        } else {
+            // Linear search for non-root nodes.
+            var edge_ref = node;
+            if (edge_ref == NO_EDGE or edge_ref >= self.edges.len) return null;
+            if (!self.isEdgeOccupied(edge_ref)) return null;
+
+            while (true) {
+                const idx: usize = @intCast(edge_ref);
+                const rec = self.edges[idx];
+                if (self.unicharId(rec) == unichar_id) {
+                    if (!require_word_end or self.isWordEnd(rec)) {
+                        return edge_ref;
+                    }
+                }
+                if (self.isMarkerFlag(rec)) break; // last edge in this node
+                edge_ref += 1;
+                if (edge_ref >= self.edges.len) break;
+            }
+            return null;
+        }
+    }
+
+    /// Returns true if the given word (as a slice of unichar IDs) is in the DAWG.
+    pub fn wordInDawg(self: SquishedDawg, word: []const u32) bool {
+        if (word.len == 0) return false;
+
+        var node: u64 = 0;
+        for (word[0 .. word.len - 1]) |uid| {
+            const edge_idx = self.edgeCharOf(node, uid, false) orelse return false;
+            node = self.nextNode(self.edges[@intCast(edge_idx)]);
+            if (node == 0) return false; // dead end: all words terminated
+        }
+
+        // Last character: require word_end flag.
+        const last_uid = word[word.len - 1];
+        return self.edgeCharOf(node, last_uid, true) != null;
+    }
+
+    /// Returns true if the given prefix is a valid start of some word in the DAWG.
+    /// If the prefix has length 0, returns true (empty prefix matches anything).
+    pub fn prefixInDawg(self: SquishedDawg, word: []const u32) bool {
+        if (word.len == 0) return true;
+
+        var node: u64 = 0;
+        for (word[0 .. word.len - 1]) |uid| {
+            const edge_idx = self.edgeCharOf(node, uid, false) orelse return false;
+            node = self.nextNode(self.edges[@intCast(edge_idx)]);
+            if (node == 0) return false;
+        }
+
+        // Last character: don't require word_end — just need the edge to exist.
+        const last_uid = word[word.len - 1];
+        return self.edgeCharOf(node, last_uid, false) != null;
+    }
+
+    /// Number of edges in this DAWG.
+    pub fn numEdges(self: SquishedDawg) usize {
+        return self.edges.len;
+    }
+
+    // ── Internal helpers ────────────────────────────────────────────────
+
+    /// Count the number of consecutive forward edges starting at `node`.
+    fn countForwardEdges(self: SquishedDawg, node: u64) u64 {
+        var edge_ref = node;
+        var count: u64 = 0;
+
+        if (!self.isForwardEdge(edge_ref)) return 0;
+
+        while (edge_ref < self.edges.len) {
+            count += 1;
+            if (self.isMarkerFlag(self.edges[@intCast(edge_ref)])) break;
+            edge_ref += 1;
+        }
+
+        return count;
+    }
+
+    /// Compute flag_start_bit = ceil(log2(unicharset_size + 1)).
+    /// Uses integer bit counting to avoid floating-point precision issues.
+    fn computeFlagStartBit(uc_size: u32) u6 {
+        // We need ceil(log2(uc_size + 1)).
+        // If uc_size + 1 is a power of two, log2 is exact.
+        // Otherwise, floor(log2) + 1 gives ceiling.
+        const val: u64 = @as(u64, uc_size) + 1;
+        if (val <= 1) return 1; // edge case: uc_size == 0
+
+        // Number of bits needed to represent (val - 1), which equals floor(log2(val-1)) + 1.
+        // For a power of two val, we need exactly log2(val) bits to represent val itself,
+        // but ceil(log2(val)) = log2(val) when val is a power of two.
+        //
+        // std.math.log2_int gives floor(log2(x)) for x > 0.
+        // ceil(log2(x)) = floor(log2(x-1)) + 1 when x > 1, or = floor(log2(x)) when x is pow2.
+        const bits = 64 - @clz(val - 1);
+        return @intCast(bits);
+    }
+};
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 test "parse eng.traineddata from file" {
@@ -782,4 +1114,349 @@ test "unicharset normed field and comment stripping" {
     try std.testing.expectEqual(@as(u32, 87), uc.chars[0].other_case);
     try std.testing.expectEqual(@as(u8, 0), uc.chars[0].direction);
     try std.testing.expectEqual(@as(u32, 3), uc.chars[0].mirror);
+}
+
+// ── SquishedDawg Tests ──────────────────────────────────────────────────────
+
+test "SquishedDawg computeFlagStartBit" {
+    // ceil(log2(1)) = 0 ... but we need at least 1 bit for unichar 0
+    // Actually: computeFlagStartBit(0) -> ceil(log2(0+1)) = ceil(log2(1)) = 0
+    // But the code returns 1 for the edge case of val <= 1.
+    // For uc_size=0, val=1: clz-based formula gives 0, but we clamp to 1.
+    try std.testing.expectEqual(@as(u6, 1), SquishedDawg.computeFlagStartBit(0));
+
+    // ceil(log2(2)) = 1
+    try std.testing.expectEqual(@as(u6, 1), SquishedDawg.computeFlagStartBit(1));
+
+    // ceil(log2(3)) = 2
+    try std.testing.expectEqual(@as(u6, 2), SquishedDawg.computeFlagStartBit(2));
+
+    // ceil(log2(4)) = 2
+    try std.testing.expectEqual(@as(u6, 2), SquishedDawg.computeFlagStartBit(3));
+
+    // ceil(log2(5)) = 3
+    try std.testing.expectEqual(@as(u6, 3), SquishedDawg.computeFlagStartBit(4));
+
+    // ceil(log2(9)) = 4
+    try std.testing.expectEqual(@as(u6, 4), SquishedDawg.computeFlagStartBit(8));
+
+    // ceil(log2(113)) = 7 (typical for eng.traineddata with 112 chars)
+    try std.testing.expectEqual(@as(u6, 7), SquishedDawg.computeFlagStartBit(112));
+
+    // ceil(log2(129)) = 8 (unicharset_size = 128)
+    try std.testing.expectEqual(@as(u6, 8), SquishedDawg.computeFlagStartBit(128));
+
+    // Cross-check with Tesseract's floating-point formula.
+    // Tesseract: ceil(log(113.0) / log(2.0)) = ceil(6.820...) = 7
+    try std.testing.expectEqual(@as(u6, 7), SquishedDawg.computeFlagStartBit(112));
+}
+
+test "SquishedDawg edge accessors on synthetic record" {
+    // Create a minimal DAWG with unicharset_size = 7 (need 3 bits for IDs 0-7).
+    // flag_start_bit = ceil(log2(8)) = 3
+    // Bits: [0..2] = unichar_id, [3..5] = flags, [6..63] = next_node
+    //
+    // Build edge: unichar_id=5, flags=MARKER|WERD_END (0b101=5), next_node=42
+    // edge = 5 | (5 << 3) | (42 << 6) = 5 | 40 | 2688 = 2733
+    const flag_start: u6 = 3;
+    const next_start: u6 = 6;
+    const letter_mask: u64 = (1 << flag_start) - 1; // 0b111 = 7
+    const next_node_mask: u64 = ~@as(u64, 0) << next_start;
+    const flags_mask: u64 = ~(letter_mask | next_node_mask);
+
+    const edge_val: u64 = 5 | (@as(u64, 5) << flag_start) | (@as(u64, 42) << next_start);
+
+    // Build a 1-edge array for the struct.
+    var edge_arr = [_]u64{edge_val};
+
+    const dawg = SquishedDawg{
+        .edges = &edge_arr,
+        .unicharset_size = 7,
+        .letter_mask = letter_mask,
+        .flags_mask = flags_mask,
+        .next_node_mask = next_node_mask,
+        .flag_start_bit = flag_start,
+        .next_node_start_bit = next_start,
+        .num_forward_edges_in_node0 = 1,
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expectEqual(@as(u32, 5), dawg.unicharId(edge_val));
+    try std.testing.expectEqual(@as(u64, 42), dawg.nextNode(edge_val));
+    try std.testing.expect(dawg.isMarkerFlag(edge_val)); // MARKER_FLAG (bit 0 of flags)
+    try std.testing.expect(!dawg.isBackwardEdge(edge_val)); // DIRECTION_FLAG (bit 1) is 0
+    try std.testing.expect(dawg.isWordEnd(edge_val)); // WERD_END_FLAG (bit 2 of flags)
+}
+
+test "SquishedDawg synthetic word lookup" {
+    // Build a tiny DAWG that contains the word [1, 2, 3] (unichar IDs).
+    // unicharset_size = 7 -> flag_start_bit = 3, next_node_start_bit = 6
+    //
+    // Graph structure:
+    //   Node 0 (edge 0): uid=1, next_node=1, marker=1, word_end=0
+    //   Node 1 (edge 1): uid=2, next_node=2, marker=1, word_end=0
+    //   Node 2 (edge 2): uid=3, next_node=0, marker=1, word_end=1
+    //
+    const flag_start: u6 = 3;
+    const next_start: u6 = 6;
+    const letter_mask: u64 = (1 << flag_start) - 1;
+    const next_node_mask: u64 = ~@as(u64, 0) << next_start;
+    const flags_mask: u64 = ~(letter_mask | next_node_mask);
+
+    // Helper to build an edge record.
+    const mkEdge = struct {
+        fn f(uid: u64, next: u64, marker: bool, word_end: bool) u64 {
+            var flags: u64 = 0;
+            if (marker) flags |= MARKER_FLAG;
+            if (word_end) flags |= WERD_END_FLAG;
+            return uid | (flags << flag_start) | (next << next_start);
+        }
+    }.f;
+
+    var edges = [_]u64{
+        mkEdge(1, 1, true, false), // node 0, edge 0: uid=1 -> node 1
+        mkEdge(2, 2, true, false), // node 1, edge 1: uid=2 -> node 2
+        mkEdge(3, 0, true, true), //  node 2, edge 2: uid=3, word_end
+    };
+
+    var dawg = SquishedDawg{
+        .edges = &edges,
+        .unicharset_size = 7,
+        .letter_mask = letter_mask,
+        .flags_mask = flags_mask,
+        .next_node_mask = next_node_mask,
+        .flag_start_bit = flag_start,
+        .next_node_start_bit = next_start,
+        .num_forward_edges_in_node0 = 1,
+        .allocator = std.testing.allocator,
+    };
+
+    // The word [1, 2, 3] should be found.
+    const word_good = [_]u32{ 1, 2, 3 };
+    try std.testing.expect(dawg.wordInDawg(&word_good));
+
+    // The prefix [1, 2] should be in the DAWG.
+    const prefix = [_]u32{ 1, 2 };
+    try std.testing.expect(dawg.prefixInDawg(&prefix));
+
+    // The word [1, 2] is NOT a complete word (no word_end on uid=2).
+    try std.testing.expect(!dawg.wordInDawg(&prefix));
+
+    // A word [1, 2, 4] should not be found (uid=4 not at node 2).
+    const word_bad = [_]u32{ 1, 2, 4 };
+    try std.testing.expect(!dawg.wordInDawg(&word_bad));
+
+    // A word [5] should not be found (uid=5 not at node 0).
+    const word_missing = [_]u32{5};
+    try std.testing.expect(!dawg.wordInDawg(&word_missing));
+
+    // Empty word should not be found.
+    const word_empty: []const u32 = &.{};
+    try std.testing.expect(!dawg.wordInDawg(word_empty));
+}
+
+test "SquishedDawg synthetic multi-edge node" {
+    // Build a DAWG with two words: [1, 3] and [2, 4]
+    // Both start from node 0, which has 2 edges.
+    // unicharset_size = 7 -> flag_start_bit = 3, next_node_start_bit = 6
+    //
+    // Node 0 (edges 0-1, sorted by uid for binary search):
+    //   edge 0: uid=1, next_node=2, marker=0
+    //   edge 1: uid=2, next_node=3, marker=1
+    // Node at index 2 (edge 2):
+    //   edge 2: uid=3, next_node=0, marker=1, word_end=1
+    // Node at index 3 (edge 3):
+    //   edge 3: uid=4, next_node=0, marker=1, word_end=1
+
+    const flag_start: u6 = 3;
+    const next_start: u6 = 6;
+    const letter_mask: u64 = (1 << flag_start) - 1;
+    const next_node_mask: u64 = ~@as(u64, 0) << next_start;
+    const flags_mask: u64 = ~(letter_mask | next_node_mask);
+
+    const mkEdge = struct {
+        fn f(uid: u64, next: u64, marker: bool, word_end: bool) u64 {
+            var flags: u64 = 0;
+            if (marker) flags |= MARKER_FLAG;
+            if (word_end) flags |= WERD_END_FLAG;
+            return uid | (flags << flag_start) | (next << next_start);
+        }
+    }.f;
+
+    var edges = [_]u64{
+        mkEdge(1, 2, false, false), // node 0, edge 0
+        mkEdge(2, 3, true, false), //  node 0, edge 1 (last in node)
+        mkEdge(3, 0, true, true), //   node at 2
+        mkEdge(4, 0, true, true), //   node at 3
+    };
+
+    var dawg = SquishedDawg{
+        .edges = &edges,
+        .unicharset_size = 7,
+        .letter_mask = letter_mask,
+        .flags_mask = flags_mask,
+        .next_node_mask = next_node_mask,
+        .flag_start_bit = flag_start,
+        .next_node_start_bit = next_start,
+        .num_forward_edges_in_node0 = 2,
+        .allocator = std.testing.allocator,
+    };
+
+    // Word [1, 3] should be found.
+    const word1 = [_]u32{ 1, 3 };
+    try std.testing.expect(dawg.wordInDawg(&word1));
+
+    // Word [2, 4] should be found.
+    const word2 = [_]u32{ 2, 4 };
+    try std.testing.expect(dawg.wordInDawg(&word2));
+
+    // Word [1, 4] should NOT be found (uid=4 not at node 2).
+    const bad = [_]u32{ 1, 4 };
+    try std.testing.expect(!dawg.wordInDawg(&bad));
+
+    // Word [2, 3] should NOT be found (uid=3 not at node 3).
+    const bad2 = [_]u32{ 2, 3 };
+    try std.testing.expect(!dawg.wordInDawg(&bad2));
+}
+
+test "SquishedDawg load error cases" {
+    // Too small.
+    const tiny = [_]u8{ 0x2A, 0x00 };
+    try std.testing.expectError(DawgError.DataTooSmall, SquishedDawg.load(std.testing.allocator, &tiny));
+
+    // Bad magic.
+    var bad_magic: [18]u8 = undefined;
+    std.mem.writeInt(i16, bad_magic[0..2], 99, .little);
+    std.mem.writeInt(i32, bad_magic[2..6], 10, .little);
+    std.mem.writeInt(i32, bad_magic[6..10], 1, .little);
+    @memset(bad_magic[10..18], 0);
+    try std.testing.expectError(DawgError.BadMagicNumber, SquishedDawg.load(std.testing.allocator, &bad_magic));
+
+    // Bad unicharset_size (0).
+    var bad_uc: [18]u8 = undefined;
+    std.mem.writeInt(i16, bad_uc[0..2], 42, .little);
+    std.mem.writeInt(i32, bad_uc[2..6], 0, .little);
+    std.mem.writeInt(i32, bad_uc[6..10], 1, .little);
+    @memset(bad_uc[10..18], 0);
+    try std.testing.expectError(DawgError.BadUnicharsetSize, SquishedDawg.load(std.testing.allocator, &bad_uc));
+
+    // Bad num_edges (0).
+    var bad_ne: [10]u8 = undefined;
+    std.mem.writeInt(i16, bad_ne[0..2], 42, .little);
+    std.mem.writeInt(i32, bad_ne[2..6], 10, .little);
+    std.mem.writeInt(i32, bad_ne[6..10], 0, .little);
+    try std.testing.expectError(DawgError.BadEdgeCount, SquishedDawg.load(std.testing.allocator, &bad_ne));
+
+    // Truncated edges: declares 2 edges but only has room for 1.
+    var truncated: [18]u8 = undefined;
+    std.mem.writeInt(i16, truncated[0..2], 42, .little);
+    std.mem.writeInt(i32, truncated[2..6], 10, .little);
+    std.mem.writeInt(i32, truncated[6..10], 2, .little); // 2 edges = 16 bytes needed
+    @memset(truncated[10..18], 0); // only 8 bytes of edge data
+    try std.testing.expectError(DawgError.TruncatedEdges, SquishedDawg.load(std.testing.allocator, &truncated));
+}
+
+test "SquishedDawg load synthetic binary" {
+    // Build a binary DAWG blob manually and verify load + lookup.
+    // Word: [1, 2] with unicharset_size=4 -> flag_start_bit = ceil(log2(5)) = 3
+    //
+    // Node 0 (edge 0): uid=1, next_node=1, marker=1, word_end=0
+    // Node 1 (edge 1): uid=2, next_node=0, marker=1, word_end=1
+
+    const flag_start: u6 = 3;
+    const next_start: u6 = 6;
+
+    const edge0: u64 = 1 | (@as(u64, MARKER_FLAG) << flag_start) | (@as(u64, 1) << next_start);
+    const edge1: u64 = 2 | (@as(u64, MARKER_FLAG | WERD_END_FLAG) << flag_start) | (@as(u64, 0) << next_start);
+
+    // Header: i16 magic(42), i32 uc_size(4), i32 num_edges(2)
+    // Then 2 x u64 edges.
+    var buf: [10 + 16]u8 = undefined;
+    std.mem.writeInt(i16, buf[0..2], 42, .little);
+    std.mem.writeInt(i32, buf[2..6], 4, .little);
+    std.mem.writeInt(i32, buf[6..10], 2, .little);
+    std.mem.writeInt(u64, buf[10..18], edge0, .little);
+    std.mem.writeInt(u64, buf[18..26], edge1, .little);
+
+    var dawg = try SquishedDawg.load(std.testing.allocator, &buf);
+    defer dawg.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), dawg.numEdges());
+    try std.testing.expectEqual(@as(u32, 4), dawg.unicharset_size);
+    try std.testing.expectEqual(@as(u6, 3), dawg.flag_start_bit);
+    try std.testing.expectEqual(@as(u6, 6), dawg.next_node_start_bit);
+
+    // Verify edge accessors on loaded data.
+    try std.testing.expectEqual(@as(u32, 1), dawg.unicharId(dawg.edges[0]));
+    try std.testing.expectEqual(@as(u64, 1), dawg.nextNode(dawg.edges[0]));
+    try std.testing.expect(dawg.isMarkerFlag(dawg.edges[0]));
+    try std.testing.expect(!dawg.isWordEnd(dawg.edges[0]));
+
+    try std.testing.expectEqual(@as(u32, 2), dawg.unicharId(dawg.edges[1]));
+    try std.testing.expect(dawg.isWordEnd(dawg.edges[1]));
+
+    // Word lookup.
+    const word = [_]u32{ 1, 2 };
+    try std.testing.expect(dawg.wordInDawg(&word));
+
+    const bad_word = [_]u32{ 1, 3 };
+    try std.testing.expect(!dawg.wordInDawg(&bad_word));
+}
+
+test "SquishedDawg load from eng.traineddata" {
+    const file = std.fs.cwd().openFile("test/testdata/eng.traineddata", .{}) catch |err| {
+        std.debug.print("Skipping test: cannot open test file: {}\n", .{err});
+        return;
+    };
+    defer file.close();
+
+    const data = file.readToEndAlloc(std.testing.allocator, 16 * 1024 * 1024) catch |err| {
+        std.debug.print("Skipping test: cannot read test file: {}\n", .{err});
+        return;
+    };
+    defer std.testing.allocator.free(data);
+
+    const mgr = try TessdataManager.init(data);
+
+    // Load all three LSTM DAWG types.
+    const dawg_types = [_]TessdataType{
+        .lstm_punc_dawg,
+        .lstm_system_dawg,
+        .lstm_number_dawg,
+    };
+    const dawg_names = [_][]const u8{
+        "lstm_punc_dawg",
+        "lstm_system_dawg",
+        "lstm_number_dawg",
+    };
+
+    for (dawg_types, dawg_names) |dt, name| {
+        const comp = mgr.getComponent(dt) orelse {
+            std.debug.print("Skipping {s}: component not present\n", .{name});
+            continue;
+        };
+
+        var dawg = try SquishedDawg.load(std.testing.allocator, comp);
+        defer dawg.deinit();
+
+        // All DAWGs should have > 0 edges.
+        try std.testing.expect(dawg.numEdges() > 0);
+        // The unicharset_size should match expected value for eng (112).
+        try std.testing.expectEqual(@as(u32, 112), dawg.unicharset_size);
+        // flag_start_bit for 112 chars = ceil(log2(113)) = 7
+        try std.testing.expectEqual(@as(u6, 7), dawg.flag_start_bit);
+        try std.testing.expectEqual(@as(u6, 10), dawg.next_node_start_bit);
+    }
+
+    // Test the system DAWG more thoroughly: it should be the largest.
+    if (mgr.getComponent(.lstm_system_dawg)) |sys_data| {
+        var sys_dawg = try SquishedDawg.load(std.testing.allocator, sys_data);
+        defer sys_dawg.deinit();
+
+        // The system DAWG for eng should have many edges (a real dictionary).
+        try std.testing.expect(sys_dawg.numEdges() > 100);
+
+        // Verify node 0 has forward edges for binary search.
+        try std.testing.expect(sys_dawg.num_forward_edges_in_node0 > 0);
+    }
 }
