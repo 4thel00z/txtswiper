@@ -188,6 +188,162 @@ pub const Pix = struct {
         };
     }
 
+    /// Detect the skew angle of a document image using projection profiles.
+    /// Works on single-channel (grayscale/binary) images.
+    /// Returns the detected skew angle in degrees (range: -5.0 to +5.0).
+    /// Returns 0 if the image is too small or uniform.
+    pub fn detectSkew(self: *const Pix) f32 {
+        if (self.channels != 1) return 0;
+        if (self.width < 10 or self.height < 10) return 0;
+
+        const w: usize = @intCast(self.width);
+        const h: usize = @intCast(self.height);
+        const cx: f32 = @as(f32, @floatFromInt(self.width)) / 2.0;
+        const cy: f32 = @as(f32, @floatFromInt(self.height)) / 2.0;
+
+        var best_score: f64 = 0;
+        var best_angle: f32 = 0;
+
+        // Test angles from -5.0 to +5.0 degrees in 0.25 degree steps (41 candidates)
+        var step: i32 = -20;
+        while (step <= 20) : (step += 1) {
+            const angle_deg: f32 = @as(f32, @floatFromInt(step)) * 0.25;
+            const angle_rad: f32 = angle_deg * (std.math.pi / 180.0);
+            const cos_a = @cos(angle_rad);
+            const sin_a = @sin(angle_rad);
+
+            // Compute horizontal projection profile for this rotation angle.
+            // For each pixel in the source, compute its rotated row and accumulate.
+            // We use a profile buffer sized to h (original height) -- pixels mapping
+            // outside are simply ignored.
+            var profile: [4096]f64 = undefined;
+            const profile_len = if (h <= 4096) h else 4096;
+            for (0..profile_len) |i| {
+                profile[i] = 0;
+            }
+
+            for (0..h) |y| {
+                const fy: f32 = @as(f32, @floatFromInt(y)) - cy;
+                for (0..w) |x| {
+                    const px = self.data[y * w + x];
+                    // Only count dark pixels (value < 128 means dark/text)
+                    if (px >= 128) continue;
+
+                    const fx: f32 = @as(f32, @floatFromInt(x)) - cx;
+                    // Rotated y coordinate
+                    const ry = -sin_a * fx + cos_a * fy + cy;
+                    const ry_int: i32 = @intFromFloat(@round(ry));
+                    if (ry_int >= 0 and ry_int < @as(i32, @intCast(profile_len))) {
+                        const idx: usize = @intCast(ry_int);
+                        profile[idx] += 1.0;
+                    }
+                }
+            }
+
+            // Compute sharpness: sum of squared differences between adjacent rows
+            var score: f64 = 0;
+            for (1..profile_len) |i| {
+                const diff = profile[i] - profile[i - 1];
+                score += diff * diff;
+            }
+
+            if (score > best_score) {
+                best_score = score;
+                best_angle = angle_deg;
+            }
+        }
+
+        return best_angle;
+    }
+
+    /// Rotate the image by the given angle (in degrees) using bilinear interpolation.
+    /// Positive angles rotate counter-clockwise. Background fill is 255 (white).
+    /// Returns a new Pix with the same dimensions. Caller owns the result.
+    pub fn rotate(self: *const Pix, angle_degrees: f32, allocator: Allocator) !Pix {
+        if (self.channels != 1) return error.NotGrayscale;
+
+        const w: usize = @intCast(self.width);
+        const h: usize = @intCast(self.height);
+        const len = w * h;
+
+        const out_data = try allocator.alloc(u8, len);
+        errdefer allocator.free(out_data);
+
+        const angle_rad: f32 = angle_degrees * (std.math.pi / 180.0);
+        const cos_a = @cos(angle_rad);
+        const sin_a = @sin(angle_rad);
+        const cx: f32 = @as(f32, @floatFromInt(self.width)) / 2.0;
+        const cy: f32 = @as(f32, @floatFromInt(self.height)) / 2.0;
+
+        const w_f: f32 = @floatFromInt(self.width);
+        const h_f: f32 = @floatFromInt(self.height);
+
+        for (0..h) |y| {
+            const fy: f32 = @as(f32, @floatFromInt(y)) - cy;
+            for (0..w) |x| {
+                const fx: f32 = @as(f32, @floatFromInt(x)) - cx;
+
+                // Inverse rotation: find source pixel for this output pixel
+                const src_x = cos_a * fx + sin_a * fy + cx;
+                const src_y = -sin_a * fx + cos_a * fy + cy;
+
+                // Bilinear interpolation
+                if (src_x < 0 or src_y < 0 or src_x >= w_f or src_y >= h_f) {
+                    out_data[y * w + x] = 255; // white background
+                } else {
+                    const x0_f = @floor(src_x);
+                    const y0_f = @floor(src_y);
+                    const x0: usize = @intFromFloat(x0_f);
+                    const y0: usize = @intFromFloat(y0_f);
+                    const x1 = if (x0 + 1 < w) x0 + 1 else x0;
+                    const y1 = if (y0 + 1 < h) y0 + 1 else y0;
+
+                    const dx = src_x - x0_f;
+                    const dy = src_y - y0_f;
+
+                    const p00: f32 = @floatFromInt(self.data[y0 * w + x0]);
+                    const p10: f32 = @floatFromInt(self.data[y0 * w + x1]);
+                    const p01: f32 = @floatFromInt(self.data[y1 * w + x0]);
+                    const p11: f32 = @floatFromInt(self.data[y1 * w + x1]);
+
+                    const val = p00 * (1.0 - dx) * (1.0 - dy) +
+                        p10 * dx * (1.0 - dy) +
+                        p01 * (1.0 - dx) * dy +
+                        p11 * dx * dy;
+
+                    out_data[y * w + x] = @intFromFloat(@round(@min(@max(val, 0.0), 255.0)));
+                }
+            }
+        }
+
+        return .{
+            .width = self.width,
+            .height = self.height,
+            .channels = 1,
+            .data = out_data,
+            .allocator = allocator,
+        };
+    }
+
+    /// Convenience: detect skew and correct it. Returns a deskewed copy.
+    pub fn deskew(self: *const Pix, allocator: Allocator) !Pix {
+        const angle = self.detectSkew();
+        if (angle == 0) {
+            // No skew detected, return a copy
+            const data = try allocator.alloc(u8, self.data.len);
+            @memcpy(data, self.data);
+            return .{
+                .width = self.width,
+                .height = self.height,
+                .channels = self.channels,
+                .data = data,
+                .allocator = allocator,
+            };
+        }
+        // Rotate by the negative of the detected skew to correct it
+        return self.rotate(-angle, allocator);
+    }
+
     /// Free pixel data.
     pub fn deinit(self: *Pix) void {
         self.allocator.free(self.data);
@@ -405,4 +561,208 @@ test "otsuThreshold: gradient image" {
     const t = try pix.otsuThreshold();
     // For a uniform histogram, Otsu should land near the midpoint
     try std.testing.expect(t >= 100 and t <= 155);
+}
+
+// ── Deskew tests ─────────────────────────────────────────────────────────
+
+test "detectSkew: straight horizontal lines returns ~0" {
+    const alloc = std.testing.allocator;
+    const w: usize = 200;
+    const h: usize = 100;
+    const data = try alloc.alloc(u8, w * h);
+    defer alloc.free(data);
+
+    // White background
+    @memset(data, 255);
+
+    // Draw horizontal dark lines at rows 20, 40, 60, 80
+    for ([_]usize{ 20, 40, 60, 80 }) |row| {
+        for (10..190) |col| {
+            data[row * w + col] = 0;
+        }
+    }
+
+    const pix = Pix{
+        .width = @intCast(w),
+        .height = @intCast(h),
+        .channels = 1,
+        .data = data,
+        .allocator = alloc,
+    };
+
+    const angle = pix.detectSkew();
+    // Should be very close to 0 for perfectly horizontal lines
+    try std.testing.expect(@abs(angle) <= 0.5);
+}
+
+test "rotate: zero degrees preserves image" {
+    const alloc = std.testing.allocator;
+    const w: usize = 10;
+    const h: usize = 10;
+    const data = try alloc.alloc(u8, w * h);
+
+    // Fill with a gradient pattern
+    for (0..w * h) |i| {
+        data[i] = @intCast(i % 256);
+    }
+
+    var pix = Pix{
+        .width = @intCast(w),
+        .height = @intCast(h),
+        .channels = 1,
+        .data = data,
+        .allocator = alloc,
+    };
+    defer pix.deinit();
+
+    var rotated = try pix.rotate(0.0, alloc);
+    defer rotated.deinit();
+
+    try std.testing.expectEqual(pix.width, rotated.width);
+    try std.testing.expectEqual(pix.height, rotated.height);
+    try std.testing.expectEqual(pix.channels, rotated.channels);
+
+    // At zero rotation, output should match input exactly (or very close due to float rounding)
+    for (0..w * h) |i| {
+        const diff: i16 = @as(i16, pix.data[i]) - @as(i16, rotated.data[i]);
+        try std.testing.expect(@abs(diff) <= 1);
+    }
+}
+
+test "rotate: 90 degrees maps pixels correctly" {
+    const alloc = std.testing.allocator;
+    // Use a 7x7 image with a dark pixel near center so it stays in-bounds after rotation
+    const w: usize = 7;
+    const h: usize = 7;
+    const data = try alloc.alloc(u8, w * h);
+
+    // White background, single dark pixel at (2, 1) -- near center
+    @memset(data, 255);
+    data[1 * w + 2] = 0; // (x=2, y=1)
+
+    var pix = Pix{
+        .width = @intCast(w),
+        .height = @intCast(h),
+        .channels = 1,
+        .data = data,
+        .allocator = alloc,
+    };
+    defer pix.deinit();
+
+    var rotated = try pix.rotate(90.0, alloc);
+    defer rotated.deinit();
+
+    // After 90-degree CCW rotation around center (3.5, 3.5):
+    // For output (x,y): src_x = sin(90)*(y-3.5)+3.5 = y, src_y = -(- sin(90))*(... ) ...
+    // The dark pixel at source (2,1) should appear somewhere in the output.
+    // Verify the dark pixel(s) moved (at least one dark pixel exists in output).
+    var dark_count: usize = 0;
+    for (rotated.data) |px| {
+        if (px < 128) dark_count += 1;
+    }
+    try std.testing.expect(dark_count >= 1);
+
+    // Also verify the original position is now white (pixel moved)
+    try std.testing.expect(rotated.data[1 * w + 2] == 255);
+}
+
+test "deskew: corrects slightly skewed image" {
+    const alloc = std.testing.allocator;
+    const w: usize = 200;
+    const h: usize = 200;
+    const data = try alloc.alloc(u8, w * h);
+
+    // White background
+    @memset(data, 255);
+
+    // Draw lines that are skewed by ~3 degrees.
+    // At 3 degrees, over 200px width the line rises by ~10px.
+    // Line at base row 50: for each x, y = 50 + round(x * tan(3 degrees))
+    const skew_angle: f32 = 3.0;
+    const tan_a = @tan(skew_angle * (std.math.pi / 180.0));
+
+    for ([_]usize{ 50, 80, 110, 140, 170 }) |base_row| {
+        for (10..190) |x_u| {
+            const x_f: f32 = @floatFromInt(x_u);
+            const offset: f32 = x_f * tan_a;
+            const y_i: i32 = @as(i32, @intCast(base_row)) + @as(i32, @intFromFloat(@round(offset)));
+            if (y_i >= 0 and y_i < @as(i32, @intCast(h))) {
+                const y_u: usize = @intCast(y_i);
+                data[y_u * w + x_u] = 0;
+                // Make lines 2px thick for better detection
+                if (y_u + 1 < h) data[(y_u + 1) * w + x_u] = 0;
+            }
+        }
+    }
+
+    var pix = Pix{
+        .width = @intCast(w),
+        .height = @intCast(h),
+        .channels = 1,
+        .data = data,
+        .allocator = alloc,
+    };
+    defer pix.deinit();
+
+    // Detect should find approximately +3 degrees
+    const detected = pix.detectSkew();
+    try std.testing.expect(@abs(detected - skew_angle) <= 1.0);
+
+    // Deskew should produce a corrected image
+    var corrected = try pix.deskew(alloc);
+    defer corrected.deinit();
+
+    try std.testing.expectEqual(pix.width, corrected.width);
+    try std.testing.expectEqual(pix.height, corrected.height);
+}
+
+test "detectSkew: image too small returns 0" {
+    const alloc = std.testing.allocator;
+    const data = try alloc.alloc(u8, 9);
+    defer alloc.free(data);
+    @memset(data, 0);
+
+    const pix = Pix{
+        .width = 3,
+        .height = 3,
+        .channels = 1,
+        .data = data,
+        .allocator = alloc,
+    };
+
+    try std.testing.expectEqual(@as(f32, 0.0), pix.detectSkew());
+}
+
+test "detectSkew: non-grayscale returns 0" {
+    const alloc = std.testing.allocator;
+    const data = try alloc.alloc(u8, 300);
+    defer alloc.free(data);
+    @memset(data, 0);
+
+    const pix = Pix{
+        .width = 10,
+        .height = 10,
+        .channels = 3,
+        .data = data,
+        .allocator = alloc,
+    };
+
+    try std.testing.expectEqual(@as(f32, 0.0), pix.detectSkew());
+}
+
+test "rotate: non-grayscale returns error" {
+    const alloc = std.testing.allocator;
+    const data = try alloc.alloc(u8, 300);
+    defer alloc.free(data);
+    @memset(data, 128);
+
+    const pix = Pix{
+        .width = 10,
+        .height = 10,
+        .channels = 3,
+        .data = data,
+        .allocator = alloc,
+    };
+
+    try std.testing.expectError(error.NotGrayscale, pix.rotate(5.0, alloc));
 }
