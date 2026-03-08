@@ -422,6 +422,21 @@ pub const WeightMatrix = struct {
             output[row] = @floatCast(@as(f64, @floatFromInt(i32_sum)) * row_scale * input_scale);
         }
     }
+
+    /// Unified matrix-vector multiply: dispatches to matVecFloat or matVecI8
+    /// depending on whether the weight matrix has float or int8 weights.
+    pub fn matVec(self: WeightMatrix, input: []const f32, output: []f32) void {
+        if (self.wi != null) {
+            self.matVecI8(input, output);
+        } else {
+            self.matVecFloat(input, output);
+        }
+    }
+
+    /// Returns true if this weight matrix uses int8 quantized weights.
+    pub fn isInt8(self: WeightMatrix) bool {
+        return self.wi != null;
+    }
 };
 
 // ── Tests ────────────────────────────────────────────────────────────────────

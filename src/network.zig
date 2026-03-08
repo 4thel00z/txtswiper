@@ -22,6 +22,13 @@ pub const NetworkIO = struct {
     int_mode_: bool,
     allocator: std.mem.Allocator,
 
+    // ── 2D Stride Info ──
+    // These track the spatial dimensions of the underlying 2D image grid.
+    // width_ (total timesteps) = stride_height * stride_width.
+    // When stride_height == 1, the data is purely 1D.
+    stride_height: usize = 1,
+    stride_width: usize = 0, // 0 means "same as width_"
+
     /// Allocate a NetworkIO with the given dimensions and mode.
     /// The appropriate buffer (f_data or i_data) is allocated and zero-initialized.
     pub fn init(allocator: std.mem.Allocator, w: usize, num_features: usize, int_mode: bool) !NetworkIO {
@@ -36,6 +43,8 @@ pub const NetworkIO = struct {
                 .num_features_ = num_features,
                 .int_mode_ = true,
                 .allocator = allocator,
+                .stride_height = 1,
+                .stride_width = w,
             };
         } else {
             const buf = try allocator.alloc(f32, total);
@@ -47,8 +56,30 @@ pub const NetworkIO = struct {
                 .num_features_ = num_features,
                 .int_mode_ = false,
                 .allocator = allocator,
+                .stride_height = 1,
+                .stride_width = w,
             };
         }
+    }
+
+    /// Allocate a NetworkIO with explicit 2D stride dimensions.
+    /// Total timesteps = sh * sw. num_features is the depth per position.
+    pub fn init2D(allocator: std.mem.Allocator, sh: usize, sw: usize, num_features: usize, int_mode: bool) !NetworkIO {
+        var nio = try init(allocator, sh * sw, num_features, int_mode);
+        nio.stride_height = sh;
+        nio.stride_width = sw;
+        return nio;
+    }
+
+    /// Return the effective stride width (image width in 2D).
+    pub fn getStrideWidth(self: NetworkIO) usize {
+        if (self.stride_width == 0) return self.width_;
+        return self.stride_width;
+    }
+
+    /// Return the stride height (image height in 2D, 1 for pure 1D).
+    pub fn getStrideHeight(self: NetworkIO) usize {
+        return self.stride_height;
     }
 
     /// Free the allocated buffer.
@@ -131,7 +162,7 @@ pub const NetworkIO = struct {
 
     /// Resize the buffer to accommodate new_width * new_features.
     /// Only grows the allocation, never shrinks. Updates dimensions and zeros
-    /// the entire buffer.
+    /// the entire buffer. Resets stride to 1D (stride_height=1).
     pub fn resize(self: *NetworkIO, new_width: usize, new_features: usize) !void {
         const new_total = new_width * new_features;
         const old_total = self.width_ * self.num_features_;
@@ -152,6 +183,15 @@ pub const NetworkIO = struct {
 
         self.width_ = new_width;
         self.num_features_ = new_features;
+        self.stride_height = 1;
+        self.stride_width = new_width;
+    }
+
+    /// Resize with explicit 2D stride dimensions. Total timesteps = sh * sw.
+    pub fn resize2D(self: *NetworkIO, sh: usize, sw: usize, new_features: usize) !void {
+        try self.resize(sh * sw, new_features);
+        self.stride_height = sh;
+        self.stride_width = sw;
     }
 
     /// Copy one timestep from src into self at dest_t.
@@ -232,11 +272,15 @@ pub const FullyConnectedLayer = struct {
     }
 
     /// Forward pass: for each timestep, compute output = activation(W * input + bias).
+    /// Preserves 2D stride from input.
     pub fn forward(self: *const FullyConnectedLayer, input: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) !void {
         std.debug.assert(input.numFeatures() == self.ni);
 
         const w = input.width();
         try output.resize(w, self.no);
+        // Preserve 2D stride info (spatial dims unchanged, only features change).
+        output.stride_height = input.stride_height;
+        output.stride_width = input.stride_width;
 
         // Allocate temporary buffers for one timestep.
         const temp_input = try allocator.alloc(f32, self.ni);
@@ -249,7 +293,7 @@ pub const FullyConnectedLayer = struct {
             input.readTimeStep(t, temp_input);
 
             // Matrix-vector multiply: temp_output = W * temp_input + bias.
-            self.weights.matVecFloat(temp_input, temp_output);
+            self.weights.matVec(temp_input, temp_output);
 
             // Apply activation function.
             switch (self.activation) {
@@ -373,6 +417,9 @@ pub const LSTMLayer = struct {
 
         const w = input.width();
         try output.resize(w, self.ns);
+        // Preserve 2D stride info from input.
+        output.stride_height = input.stride_height;
+        output.stride_width = input.stride_width;
 
         // Reset state for a fresh forward pass.
         self.resetState();
@@ -405,10 +452,10 @@ pub const LSTMLayer = struct {
             const gf1_idx = @intFromEnum(GateIndex.GF1);
             const go_idx = @intFromEnum(GateIndex.GO);
 
-            self.gate_weights[ci_idx].matVecFloat(curr_input, temp_gates[ci_idx]);
-            self.gate_weights[gi_idx].matVecFloat(curr_input, temp_gates[gi_idx]);
-            self.gate_weights[gf1_idx].matVecFloat(curr_input, temp_gates[gf1_idx]);
-            self.gate_weights[go_idx].matVecFloat(curr_input, temp_gates[go_idx]);
+            self.gate_weights[ci_idx].matVec(curr_input, temp_gates[ci_idx]);
+            self.gate_weights[gi_idx].matVec(curr_input, temp_gates[gi_idx]);
+            self.gate_weights[gf1_idx].matVec(curr_input, temp_gates[gf1_idx]);
+            self.gate_weights[go_idx].matVec(curr_input, temp_gates[go_idx]);
 
             // Apply activations: CI=tanh, GI/GF1/GO=sigmoid
             activations.tanh_inplace(temp_gates[ci_idx]);
@@ -439,62 +486,87 @@ pub const LSTMLayer = struct {
 
 // ── ConvolveLayer ────────────────────────────────────────────────────────────
 //
-// A Convolve layer stacks spatial neighborhood features. It creates a sliding
-// window of size (2*half_x + 1) along the width axis and stacks all the input
-// features from each position in the window.
+// A Convolve layer stacks spatial neighborhood features. In 1D mode (half_y=0),
+// it creates a sliding window of size (2*half_x + 1) along the width axis.
+// In 2D mode (half_y>0), it creates a (2*half_x+1) x (2*half_y+1) patch and
+// stacks all features from the patch. This matches Tesseract's Convolve layer.
 //
-// Output features = ni * (2 * half_x + 1).
+// Output features = ni * (2*half_x+1) * (2*half_y+1).
 
 pub const ConvolveLayer = struct {
     ni: usize, // input features per position
-    no: usize, // output features = ni * (2*half_x + 1)
-    half_x: usize, // half window size (e.g., half_x=1 means window of 3)
+    no: usize, // output features = ni * (2*half_x+1) * (2*half_y+1)
+    half_x: usize, // half window in x (width) direction
+    half_y: usize, // half window in y (height) direction (0 for 1D mode)
 
-    /// Create a ConvolveLayer with `ni` input features and half-window `half_x`.
-    pub fn init(ni: usize, half_x: usize) ConvolveLayer {
+    /// Create a ConvolveLayer with `ni` input features and half-windows `half_x`, `half_y`.
+    pub fn init(ni: usize, half_x: usize, half_y: usize) ConvolveLayer {
         return ConvolveLayer{
             .ni = ni,
-            .no = ni * (2 * half_x + 1),
+            .no = ni * (2 * half_x + 1) * (2 * half_y + 1),
             .half_x = half_x,
+            .half_y = half_y,
         };
     }
 
-    /// Forward pass: for each timestep, stack features from the surrounding window.
-    /// Positions outside the input boundary are zero-padded.
+    /// Forward pass: for each position, stack features from the surrounding 2D window.
+    /// Positions outside the image boundary are zero-padded.
+    ///
+    /// In 2D mode, the input's stride_height and stride_width determine the spatial
+    /// layout. The output preserves the same 2D stride.
     pub fn forward(self: *const ConvolveLayer, input: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) !void {
         _ = allocator;
-        const w = input.width();
-        try output.resize(w, self.no);
-
-        const half = self.half_x;
+        const sh = input.getStrideHeight();
+        const sw = input.getStrideWidth();
         const ni = self.ni;
+        const y_scale = 2 * self.half_y + 1;
 
-        for (0..w) |t| {
-            var out_offset: usize = 0;
-            const out_buf = output.f_data.?;
+        // Output has same spatial dimensions, different feature count.
+        try output.resize2D(sh, sw, self.no);
 
-            // dx ranges from -half_x to +half_x inclusive
-            var dx: usize = 0;
-            const window_size = 2 * half + 1;
-            while (dx < window_size) : (dx += 1) {
-                // src_t = t + dx - half (avoiding underflow with checked arithmetic)
-                const shifted = t + dx;
-                if (shifted >= half and shifted - half < w) {
-                    const src_t = shifted - half;
-                    // Copy ni features from input at src_t
-                    const in_buf = input.f_data.?;
-                    const src_offset = src_t * input.num_features_;
-                    const dst_offset = t * self.no + out_offset;
-                    @memcpy(
-                        out_buf[dst_offset .. dst_offset + ni],
-                        in_buf[src_offset .. src_offset + ni],
-                    );
-                } else {
-                    // Out of bounds: fill with zeros
-                    const dst_offset = t * self.no + out_offset;
-                    @memset(out_buf[dst_offset .. dst_offset + ni], 0.0);
+        const in_buf = input.f_data.?;
+        const out_buf = output.f_data.?;
+
+        // Iterate over every 2D position.
+        for (0..sh) |py| {
+            for (0..sw) |px| {
+                const t = py * sw + px;
+                var out_ix: usize = 0;
+
+                // x window: -half_x to +half_x
+                var dxi: usize = 0;
+                const x_window = 2 * self.half_x + 1;
+                while (dxi < x_window) : (dxi += 1) {
+                    const sx_shifted = px + dxi;
+                    const sx_valid = sx_shifted >= self.half_x and (sx_shifted - self.half_x) < sw;
+
+                    if (sx_valid) {
+                        const sx = sx_shifted - self.half_x;
+
+                        // y window: -half_y to +half_y
+                        var dyi: usize = 0;
+                        while (dyi < y_scale) : (dyi += 1) {
+                            const sy_shifted = py + dyi;
+                            const sy_valid = sy_shifted >= self.half_y and (sy_shifted - self.half_y) < sh;
+
+                            const dst_off = t * self.no + out_ix;
+                            if (sy_valid) {
+                                const sy = sy_shifted - self.half_y;
+                                const src_t = sy * sw + sx;
+                                const src_off = src_t * input.num_features_;
+                                @memcpy(out_buf[dst_off .. dst_off + ni], in_buf[src_off .. src_off + ni]);
+                            } else {
+                                @memset(out_buf[dst_off .. dst_off + ni], 0.0);
+                            }
+                            out_ix += ni;
+                        }
+                    } else {
+                        // Entire x column is out of bounds.
+                        const dst_off = t * self.no + out_ix;
+                        @memset(out_buf[dst_off .. dst_off + y_scale * ni], 0.0);
+                        out_ix += y_scale * ni;
+                    }
                 }
-                out_offset += ni;
             }
         }
     }
@@ -502,56 +574,77 @@ pub const ConvolveLayer = struct {
 
 // ── MaxpoolLayer ─────────────────────────────────────────────────────────────
 //
-// Downsamples the width dimension by taking the element-wise maximum over a
-// window. The feature count is preserved.
+// Downsamples along both width and height dimensions by taking the element-wise
+// maximum over a 2D window. The feature count is preserved (this is Maxpool,
+// not Reconfig which would stack features).
+//
+// For Tesseract's Reconfig/Maxpool (NT_MAXPOOL type): output spatial dimensions
+// are [ceil(H/y_scale)][ceil(W/x_scale)], features stay the same.
 
 pub const MaxpoolLayer = struct {
     ni: usize, // input features = output features
     no: usize, // same as ni (maxpool doesn't change feature count)
     x_scale: usize, // downsampling factor along width
+    y_scale: usize, // downsampling factor along height (1 for 1D mode)
 
-    /// Create a MaxpoolLayer with `ni` features and downsampling factor `x_scale`.
-    pub fn init(ni: usize, x_scale: usize) MaxpoolLayer {
+    /// Create a MaxpoolLayer with `ni` features and downsampling factors.
+    pub fn init(ni: usize, x_scale: usize, y_scale: usize) MaxpoolLayer {
         return MaxpoolLayer{
             .ni = ni,
             .no = ni,
             .x_scale = x_scale,
+            .y_scale = y_scale,
         };
     }
 
-    /// Forward pass: downsample width by taking element-wise max over each window.
+    /// Forward pass: downsample by taking element-wise max over 2D windows.
+    ///
+    /// In 2D mode, reads stride_height/stride_width from input to determine
+    /// the spatial grid, and outputs a downsampled grid.
     pub fn forward(self: *const MaxpoolLayer, input: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) !void {
         _ = allocator;
-        const in_w = input.width();
-        const out_w = (in_w + self.x_scale - 1) / self.x_scale; // ceil division
-        try output.resize(out_w, self.no);
+        const in_sh = input.getStrideHeight();
+        const in_sw = input.getStrideWidth();
+        const nf = self.ni;
+
+        const out_sh = (in_sh + self.y_scale - 1) / self.y_scale;
+        const out_sw = (in_sw + self.x_scale - 1) / self.x_scale;
+        try output.resize2D(out_sh, out_sw, nf);
 
         const out_buf = output.f_data.?;
         const in_buf = input.f_data.?;
-        const nf = self.no;
 
-        for (0..out_w) |out_t| {
-            const src_start = out_t * self.x_scale;
-            const dst_offset = out_t * nf;
-            const src_offset = src_start * input.num_features_;
+        for (0..out_sh) |oy| {
+            for (0..out_sw) |ox| {
+                const out_t = oy * out_sw + ox;
+                const dst_offset = out_t * nf;
 
-            // Initialize with first position in pool window
-            @memcpy(
-                out_buf[dst_offset .. dst_offset + nf],
-                in_buf[src_offset .. src_offset + nf],
-            );
+                // Initialize with very negative values for max operation.
+                @memset(out_buf[dst_offset .. dst_offset + nf], -math.inf(f32));
 
-            // Take element-wise max over the rest of the pool window
-            var dx: usize = 1;
-            while (dx < self.x_scale) : (dx += 1) {
-                const src_t = src_start + dx;
-                if (src_t < in_w) {
-                    const src_off = src_t * input.num_features_;
-                    for (0..nf) |f_idx| {
-                        out_buf[dst_offset + f_idx] = @max(
-                            out_buf[dst_offset + f_idx],
-                            in_buf[src_off + f_idx],
-                        );
+                // Take element-wise max over the y_scale x x_scale window.
+                const src_y_start = oy * self.y_scale;
+                const src_x_start = ox * self.x_scale;
+
+                var dy: usize = 0;
+                while (dy < self.y_scale) : (dy += 1) {
+                    const sy = src_y_start + dy;
+                    if (sy >= in_sh) break;
+
+                    var dx: usize = 0;
+                    while (dx < self.x_scale) : (dx += 1) {
+                        const sx = src_x_start + dx;
+                        if (sx >= in_sw) break;
+
+                        const src_t = sy * in_sw + sx;
+                        const src_off = src_t * input.num_features_;
+
+                        for (0..nf) |f_idx| {
+                            out_buf[dst_offset + f_idx] = @max(
+                                out_buf[dst_offset + f_idx],
+                                in_buf[src_off + f_idx],
+                            );
+                        }
                     }
                 }
             }
@@ -574,12 +667,16 @@ pub const InputLayer = struct {
     depth: i32,
 
     /// Forward pass: pass-through (copies input to output).
+    /// Propagates the 2D stride information from input.
     pub fn forward(self: *const InputLayer, input: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) !void {
         _ = allocator;
         _ = self;
         const w = input.width();
         const nf = input.numFeatures();
         try output.resize(w, nf);
+        // Propagate 2D stride from input.
+        output.stride_height = input.stride_height;
+        output.stride_width = input.stride_width;
         for (0..w) |t| {
             output.copyTimeStepFrom(t, input, t);
         }
@@ -620,21 +717,62 @@ pub const ReversedLayer = struct {
         return self;
     }
 
-    /// Forward pass: reverse input, run child, reverse output.
-    /// For 1D inference, XYTranspose is treated as pass-through since
-    /// Tesseract 1D LSTM models don't actually use the transpose.
+    /// Forward pass: reverse/transpose input, run child, reverse/transpose output.
+    ///
+    /// XYTranspose: transposes the 2D grid (swaps height and width), runs the
+    /// child on the transposed data, then transposes back. This converts
+    /// row-major scanning to column-major for the LSTM.
+    ///
+    /// X/Y Reversed: reverses timestep order, runs child, reverses back.
     pub fn forward(self: *ReversedLayer, input: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) ForwardError!void {
         if (self.reversed_type == .xy_transpose) {
-            // For 1D data, XYTranspose is a pass-through.
-            try self.child.forward(input, output, allocator);
+            // Transpose the 2D input: swap height and width.
+            const sh = input.getStrideHeight();
+            const sw = input.getStrideWidth();
+            const nf = input.numFeatures();
+
+            var transposed_input = try NetworkIO.init2D(allocator, sw, sh, nf, false);
+            defer transposed_input.deinit();
+
+            // src[y][x] -> dest[x][y]: src_t = y*sw+x, dest_t = x*sh+y
+            for (0..sh) |y| {
+                for (0..sw) |x| {
+                    const src_t = y * sw + x;
+                    const dest_t = x * sh + y;
+                    transposed_input.copyTimeStepFrom(dest_t, input, src_t);
+                }
+            }
+
+            // Run child on transposed input.
+            var child_output = try NetworkIO.init(allocator, 1, 1, false);
+            defer child_output.deinit();
+            try self.child.forward(&transposed_input, &child_output, allocator);
+
+            // Transpose the output back: child output has stride [sw_out][sh_out]
+            // which we transpose to [sh_out][sw_out].
+            const out_sh = child_output.getStrideHeight();
+            const out_sw = child_output.getStrideWidth();
+            const out_nf = child_output.numFeatures();
+
+            try output.resize2D(out_sw, out_sh, out_nf);
+            for (0..out_sh) |y| {
+                for (0..out_sw) |x| {
+                    const src_t = y * out_sw + x;
+                    const dest_t = x * out_sh + y;
+                    output.copyTimeStepFrom(dest_t, &child_output, src_t);
+                }
+            }
             return;
         }
 
-        // Reverse the input timesteps
+        // X-reversed or Y-reversed: reverse timestep order.
         const w = input.width();
         const nf = input.numFeatures();
         var reversed_input = try NetworkIO.init(allocator, w, nf, false);
         defer reversed_input.deinit();
+        // Propagate stride info.
+        reversed_input.stride_height = input.stride_height;
+        reversed_input.stride_width = input.stride_width;
         for (0..w) |t| {
             reversed_input.copyTimeStepFrom(w - 1 - t, input, t);
         }
@@ -648,6 +786,8 @@ pub const ReversedLayer = struct {
         const out_w = child_output.width();
         const out_nf = child_output.numFeatures();
         try output.resize(out_w, out_nf);
+        output.stride_height = child_output.stride_height;
+        output.stride_width = child_output.stride_width;
         for (0..out_w) |t| {
             output.copyTimeStepFrom(out_w - 1 - t, &child_output, t);
         }
@@ -769,8 +909,10 @@ pub const SeriesLayer = struct {
         const n = self.layers.len;
 
         if (n == 0) {
-            // No-op: copy input to output
+            // No-op: copy input to output, preserving stride.
             try output.resize(input.width(), input.numFeatures());
+            output.stride_height = input.stride_height;
+            output.stride_width = input.stride_width;
             for (0..input.width()) |t| {
                 output.copyTimeStepFrom(t, input, t);
             }
@@ -863,6 +1005,9 @@ pub const ParallelLayer = struct {
     pub fn forward(self: *ParallelLayer, input: *const NetworkIO, output: *NetworkIO, allocator: std.mem.Allocator) ForwardError!void {
         const w = input.width();
         try output.resize(w, self.no);
+        // Preserve 2D stride from input.
+        output.stride_height = input.stride_height;
+        output.stride_width = input.stride_width;
 
         var temp = try NetworkIO.init(allocator, 1, 1, false);
         defer temp.deinit();
@@ -1074,19 +1219,20 @@ pub fn deserializeNetwork(allocator: std.mem.Allocator, reader: *weights_mod.Bin
             // Convolve::DeSerialize: i32 half_x, i32 half_y
             const half_x_i32 = reader.readI32() catch return error.UnexpectedEof;
             const half_y_i32 = reader.readI32() catch return error.UnexpectedEof;
-            _ = half_y_i32; // We only support 1D (half_y is always 0 for 1D)
             const half_x: usize = @intCast(half_x_i32);
+            const half_y: usize = if (half_y_i32 > 0) @intCast(half_y_i32) else 0;
 
-            return Layer{ .convolve = ConvolveLayer.init(ni, half_x) };
+            return Layer{ .convolve = ConvolveLayer.init(ni, half_x, half_y) };
         },
 
         .maxpool => {
             // Reconfig::DeSerialize: i32 x_scale, i32 y_scale
             const x_scale_i32 = reader.readI32() catch return error.UnexpectedEof;
-            _ = reader.readI32() catch return error.UnexpectedEof; // y_scale, ignored for 1D
+            const y_scale_i32 = reader.readI32() catch return error.UnexpectedEof;
             const x_scale: usize = @intCast(x_scale_i32);
+            const y_scale: usize = if (y_scale_i32 > 0) @intCast(y_scale_i32) else 1;
 
-            return Layer{ .maxpool = MaxpoolLayer.init(ni, x_scale) };
+            return Layer{ .maxpool = MaxpoolLayer.init(ni, x_scale, y_scale) };
         },
 
         .series, .parallel, .par_bidi_lstm, .par_2d_lstm => {
@@ -2036,7 +2182,7 @@ test "ConvolveLayer stacks neighbors" {
     const allocator = std.testing.allocator;
 
     // ni=2, half_x=1 (window of 3) -> no=6
-    const conv = ConvolveLayer.init(2, 1);
+    const conv = ConvolveLayer.init(2, 1, 0);
     try std.testing.expectEqual(@as(usize, 6), conv.no);
 
     // Input: width=4, features=2
@@ -2093,7 +2239,7 @@ test "ConvolveLayer no padding center" {
     const allocator = std.testing.allocator;
 
     // ni=3, half_x=1 (window of 3) -> no=9
-    const conv = ConvolveLayer.init(3, 1);
+    const conv = ConvolveLayer.init(3, 1, 0);
     try std.testing.expectEqual(@as(usize, 9), conv.no);
 
     // Input: width=5, features=3
@@ -2147,7 +2293,7 @@ test "MaxpoolLayer downsamples" {
     const allocator = std.testing.allocator;
 
     // ni=2, x_scale=2
-    const mp = MaxpoolLayer.init(2, 2);
+    const mp = MaxpoolLayer.init(2, 2, 1);
     try std.testing.expectEqual(@as(usize, 2), mp.no);
 
     // Input: width=4, features=2
@@ -2187,7 +2333,7 @@ test "MaxpoolLayer odd width" {
     const allocator = std.testing.allocator;
 
     // ni=2, x_scale=2
-    const mp = MaxpoolLayer.init(2, 2);
+    const mp = MaxpoolLayer.init(2, 2, 1);
 
     // Input: width=5, features=2
     //   t=0: [1, 2], t=1: [3, 4], t=2: [5, 6], t=3: [7, 8], t=4: [9, 10]
@@ -2233,7 +2379,7 @@ test "Convolve in Layer union dispatches" {
     const allocator = std.testing.allocator;
 
     // Wrap ConvolveLayer in Layer, call forward, verify
-    const conv = ConvolveLayer.init(2, 1);
+    const conv = ConvolveLayer.init(2, 1, 0);
     var layer = Layer{ .convolve = conv };
 
     try std.testing.expectEqual(@as(usize, 6), layer.numOutputs());

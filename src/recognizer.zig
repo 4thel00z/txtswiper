@@ -1,10 +1,13 @@
 const std = @import("std");
 const math = std.math;
 const tessdata = @import("tessdata.zig");
+const network_mod = @import("network.zig");
 
 const Allocator = std.mem.Allocator;
 const Unicharset = tessdata.Unicharset;
 const UnicharCompress = tessdata.UnicharCompress;
+const NetworkIO = network_mod.NetworkIO;
+const LSTMRecognizer = tessdata.LSTMRecognizer;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -534,6 +537,232 @@ fn hashCodeSequence(codes: []const u32) u64 {
     return h;
 }
 
+// ── Image Input Preparation ─────────────────────────────────────────────────
+
+/// Prepare a grayscale image as network input.
+///
+/// Scales the image to `target_height` while preserving aspect ratio using
+/// bilinear interpolation. Normalizes pixel values from [0, 255] to [-1.0, 1.0].
+///
+/// Matches Tesseract's Copy2DImage layout: the image is flattened row-by-row into
+/// a 1D sequence of timesteps with 1 feature each (the grayscale pixel value).
+/// Total timesteps = target_height * scaled_width. The network's 2D convolutions
+/// and XYTranspose layers work on this flattened representation.
+///
+/// Parameters:
+///   - allocator: Memory allocator for the result.
+///   - pixels: Grayscale pixels, row-major [height][width], values 0-255.
+///   - width: Width of the input image in pixels.
+///   - height: Height of the input image in pixels.
+///   - target_height: Target height to scale to (from network input shape, e.g. 36).
+///
+/// Returns a NetworkIO of shape [target_height * scaled_width][1].
+pub fn prepareInput(
+    allocator: Allocator,
+    pixels: []const u8,
+    width: usize,
+    height: usize,
+    target_height: usize,
+) !NetworkIO {
+    if (width == 0 or height == 0 or target_height == 0) {
+        return NetworkIO.init(allocator, 0, 1, false);
+    }
+
+    // Compute scaled width preserving aspect ratio.
+    const scaled_width = (width * target_height + height / 2) / height;
+    if (scaled_width == 0) {
+        return NetworkIO.init(allocator, 0, 1, false);
+    }
+
+    // Total timesteps = height * width in the scaled image (row-major 2D layout).
+    var nio = try NetworkIO.init2D(allocator, target_height, scaled_width, 1, false);
+    errdefer nio.deinit();
+
+    const buf = nio.f_data.?;
+
+    // Compute adaptive normalization (matching Tesseract's ComputeBlackWhite).
+    // Find min/max pixel values for contrast stretching.
+    var min_pixel: f32 = 255.0;
+    var max_pixel: f32 = 0.0;
+    for (pixels) |p| {
+        const v: f32 = @floatFromInt(p);
+        if (v < min_pixel) min_pixel = v;
+        if (v > max_pixel) max_pixel = v;
+    }
+    const black = min_pixel;
+    var contrast = (max_pixel - black) / 2.0;
+    if (contrast <= 0.0) contrast = 1.0;
+
+    // Fill the NetworkIO: row-major (for each row y, for each column x).
+    // Timestep t = y * scaled_width + x, 1 feature per timestep.
+    for (0..target_height) |y| {
+        for (0..scaled_width) |x| {
+            // Map scaled (x, y) back to source image coordinates via bilinear interpolation.
+            const src_xf: f32 = if (scaled_width > 1)
+                @as(f32, @floatFromInt(x)) * @as(f32, @floatFromInt(width - 1)) / @as(f32, @floatFromInt(scaled_width - 1))
+            else
+                @as(f32, @floatFromInt(width - 1)) * 0.5;
+
+            const src_yf: f32 = if (target_height > 1)
+                @as(f32, @floatFromInt(y)) * @as(f32, @floatFromInt(height - 1)) / @as(f32, @floatFromInt(target_height - 1))
+            else
+                @as(f32, @floatFromInt(height - 1)) * 0.5;
+
+            // Bilinear interpolation.
+            const x0: usize = @intFromFloat(@floor(src_xf));
+            const y0: usize = @intFromFloat(@floor(src_yf));
+            const x1: usize = @min(x0 + 1, width - 1);
+            const y1: usize = @min(y0 + 1, height - 1);
+
+            const dx = src_xf - @as(f32, @floatFromInt(x0));
+            const dy = src_yf - @as(f32, @floatFromInt(y0));
+
+            const p00: f32 = @floatFromInt(pixels[y0 * width + x0]);
+            const p10: f32 = @floatFromInt(pixels[y0 * width + x1]);
+            const p01: f32 = @floatFromInt(pixels[y1 * width + x0]);
+            const p11: f32 = @floatFromInt(pixels[y1 * width + x1]);
+
+            const val = p00 * (1.0 - dx) * (1.0 - dy) +
+                p10 * dx * (1.0 - dy) +
+                p01 * (1.0 - dx) * dy +
+                p11 * dx * dy;
+
+            // Normalize: match Tesseract's SetPixel: (pixel - black) / contrast - 1.0
+            const normalized = (val - black) / contrast - 1.0;
+
+            const t = y * scaled_width + x;
+            buf[t] = normalized; // 1 feature per timestep
+        }
+    }
+
+    return nio;
+}
+
+// ── Recognition Result ──────────────────────────────────────────────────────
+
+/// Holds the output of line recognition: UTF-8 text with per-character
+/// confidence scores and timestep positions.
+pub const RecognitionResult = struct {
+    /// UTF-8 text (owned).
+    text: []u8,
+    /// Per-character confidence (log probability).
+    confidences: []f32,
+    /// Per-character timestep positions.
+    timesteps: []u32,
+    allocator: Allocator,
+
+    /// Release all owned memory.
+    pub fn deinit(self: *RecognitionResult) void {
+        self.allocator.free(self.text);
+        self.allocator.free(self.confidences);
+        self.allocator.free(self.timesteps);
+    }
+};
+
+// ── Line Recognition Pipeline ───────────────────────────────────────────────
+
+/// Recognize text from a grayscale line image using a loaded LSTM model.
+///
+/// Orchestrates the complete pipeline:
+///   1. Prepare image input (scale, normalize, pack into NetworkIO)
+///   2. Network forward pass (LSTM inference)
+///   3. CTC beam search decode (softmax output -> character sequence)
+///   4. Convert to UTF-8 text with confidences
+///
+/// Parameters:
+///   - allocator: Memory allocator for all intermediate and result buffers.
+///   - model: Loaded LSTMRecognizer with network, unicharset, and recoder.
+///   - pixels: Grayscale pixels, row-major [height][width], values 0-255.
+///   - width: Width of the input image in pixels.
+///   - height: Height of the input image in pixels.
+///
+/// Returns a RecognitionResult with UTF-8 text and per-character metadata.
+/// Caller must call deinit() to free the result.
+pub fn recognizeLine(
+    allocator: Allocator,
+    model: *LSTMRecognizer,
+    pixels: []const u8,
+    width: usize,
+    height: usize,
+) !RecognitionResult {
+    // 1. Determine target height from the network input shape.
+    const target_height = model.numInputs();
+
+    // 2. Prepare image as network input.
+    var input = try prepareInput(allocator, pixels, width, height, target_height);
+    defer input.deinit();
+
+    // Handle degenerate case: empty input produces empty result.
+    if (input.width() == 0) {
+        const empty_text = try allocator.alloc(u8, 0);
+        errdefer allocator.free(empty_text);
+        const empty_confs = try allocator.alloc(f32, 0);
+        errdefer allocator.free(empty_confs);
+        const empty_ts = try allocator.alloc(u32, 0);
+        return RecognitionResult{
+            .text = empty_text,
+            .confidences = empty_confs,
+            .timesteps = empty_ts,
+            .allocator = allocator,
+        };
+    }
+
+    // 3. Run network forward pass.
+    var output = try NetworkIO.init(allocator, 1, 1, false);
+    defer output.deinit();
+
+    try model.network.forward(&input, &output, allocator);
+
+    // 4. Extract softmax probabilities.
+    const num_timesteps = output.width();
+    const num_classes = output.numFeatures();
+    const softmax_data = output.f_data.?[0 .. num_timesteps * num_classes];
+
+    // 5. Build reverse lookup table for the recoder.
+    var code_to_unichar: ?[]u32 = null;
+    defer {
+        if (code_to_unichar) |tbl| allocator.free(tbl);
+    }
+    var recoder_ptr: ?*const UnicharCompress = null;
+    if (model.recoder) |*r| {
+        code_to_unichar = try buildCodeToUnichar(allocator, r);
+        recoder_ptr = r;
+    }
+
+    // 6. CTC beam search decode.
+    const null_char: u32 = @intCast(model.null_char);
+    var ctc_result = try ctcBeamDecode(
+        allocator,
+        softmax_data,
+        num_timesteps,
+        num_classes,
+        null_char,
+        recoder_ptr,
+        code_to_unichar,
+        .{ .beam_width = 10, .top_n = 5 },
+    );
+    defer ctc_result.deinit();
+
+    // 7. Convert unichar IDs to UTF-8 text.
+    const text = try ctc_result.toText(&model.unicharset, allocator);
+    errdefer allocator.free(text);
+
+    // 8. Copy confidence and timestep arrays to owned result.
+    const result_confs = try allocator.alloc(f32, ctc_result.len());
+    errdefer allocator.free(result_confs);
+    @memcpy(result_confs, ctc_result.confidences);
+
+    const result_ts = try allocator.alloc(u32, ctc_result.len());
+    @memcpy(result_ts, ctc_result.timesteps);
+
+    return RecognitionResult{
+        .text = text,
+        .confidences = result_confs,
+        .timesteps = result_ts,
+        .allocator = allocator,
+    };
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -778,4 +1007,181 @@ test "beam search: null removal only" {
 
     try testing.expectEqual(@as(usize, 1), result.len());
     try testing.expectEqual(@as(u32, 1), result.unichar_ids[0]);
+}
+
+// ── prepareInput Tests ──────────────────────────────────────────────────────
+
+test "prepareInput: basic no scaling" {
+    // 10x5 image, target_height=5 -> no vertical scaling needed.
+    // Output: timesteps = 5 * 10 = 50, features = 1 (Tesseract 2D layout).
+    const width: usize = 10;
+    const height: usize = 5;
+    var pixels: [width * height]u8 = undefined;
+
+    // Fill with known values: gradient along x, constant along y.
+    for (0..height) |y| {
+        for (0..width) |x| {
+            pixels[y * width + x] = @intCast(x * 25); // 0, 25, 50, ..., 225
+        }
+    }
+
+    var nio = try prepareInput(test_allocator, &pixels, width, height, 5);
+    defer nio.deinit();
+
+    // Dimensions: total_timesteps = 5 * 10 = 50, num_features = 1.
+    try testing.expectEqual(@as(usize, 50), nio.width());
+    try testing.expectEqual(@as(usize, 1), nio.numFeatures());
+
+    // With adaptive normalization: pixel 0 (black) maps to -1.0,
+    // pixel 225 (max) maps to +1.0. First timestep (row 0, col 0) has pixel 0.
+    const first_val = nio.f(0)[0];
+    try testing.expectApproxEqAbs(@as(f32, -1.0), first_val, 0.02);
+}
+
+test "prepareInput: normalization values" {
+    // 3x1 image with specific values to verify normalization.
+    // With adaptive normalization: black=0, contrast=(255-0)/2=127.5
+    // pixel 0 -> (0 - 0) / 127.5 - 1.0 = -1.0
+    // pixel 128 -> (128 - 0) / 127.5 - 1.0 ≈ 0.004
+    // pixel 255 -> (255 - 0) / 127.5 - 1.0 = 1.0
+    const pixels = [_]u8{ 0, 128, 255 };
+
+    var nio = try prepareInput(test_allocator, &pixels, 3, 1, 1);
+    defer nio.deinit();
+
+    // 1x3 scaled -> total timesteps = 1 * 3 = 3, features = 1.
+    try testing.expectEqual(@as(usize, 3), nio.width());
+    try testing.expectEqual(@as(usize, 1), nio.numFeatures());
+
+    try testing.expectApproxEqAbs(@as(f32, -1.0), nio.f(0)[0], 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0.004), nio.f(1)[0], 0.02);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), nio.f(2)[0], 0.01);
+}
+
+test "prepareInput: with scaling" {
+    // 20x10 image, target_height=5 -> scale to height 5.
+    // Scaled width = 20 * 5 / 10 = 10. Total timesteps = 5 * 10 = 50.
+    const width: usize = 20;
+    const height: usize = 10;
+    var pixels: [width * height]u8 = undefined;
+    @memset(&pixels, 128); // uniform gray
+
+    var nio = try prepareInput(test_allocator, &pixels, width, height, 5);
+    defer nio.deinit();
+
+    // Dimensions: total_timesteps = 5 * 10 = 50, features = 1.
+    try testing.expectEqual(@as(usize, 50), nio.width());
+    try testing.expectEqual(@as(usize, 1), nio.numFeatures());
+
+    // All pixels are 128, so min=max=128, contrast=1.0.
+    // Normalized: (128 - 128) / 1.0 - 1.0 = -1.0 (uniform value).
+    const ts = nio.f(0);
+    for (ts) |v| {
+        try testing.expectApproxEqAbs(@as(f32, -1.0), v, 0.02);
+    }
+}
+
+test "prepareInput: empty image" {
+    var nio = try prepareInput(test_allocator, &[_]u8{}, 0, 0, 36);
+    defer nio.deinit();
+
+    try testing.expectEqual(@as(usize, 0), nio.width());
+}
+
+// ── recognizeLine Integration Tests ─────────────────────────────────────────
+
+test "recognizeLine: integration with real model" {
+    // Load the eng.traineddata model.
+    const file = std.fs.cwd().openFile("test/testdata/eng.traineddata", .{}) catch |err| {
+        std.debug.print("Skipping test: cannot open test file: {}\n", .{err});
+        return;
+    };
+    defer file.close();
+
+    const data = file.readToEndAlloc(test_allocator, 16 * 1024 * 1024) catch |err| {
+        std.debug.print("Skipping test: cannot read test file: {}\n", .{err});
+        return;
+    };
+    defer test_allocator.free(data);
+
+    var model = LSTMRecognizer.load(test_allocator, data) catch |err| {
+        std.debug.print("Skipping test: cannot load model: {}\n", .{err});
+        return;
+    };
+    defer model.deinit();
+
+    // Verify model basics.
+    try testing.expectEqual(@as(usize, 36), model.numInputs());
+    try testing.expectEqual(@as(usize, 111), model.numClasses());
+
+    // Create a synthetic white image (255 = white, should produce minimal/no text).
+    // 100 pixels wide, 36 pixels tall (matching model input height).
+    const img_w: usize = 100;
+    const img_h: usize = 36;
+    var pixels: [img_w * img_h]u8 = undefined;
+    @memset(&pixels, 255);
+
+    // Run the pipeline. This is the key integration test - it should not crash
+    // and should produce valid output even if the text is meaningless.
+    var result = try recognizeLine(test_allocator, &model, &pixels, img_w, img_h);
+    defer result.deinit();
+
+    // Verify the result is structurally valid.
+    // Text should be valid UTF-8 (may be empty or whitespace for a blank image).
+    try testing.expect(std.unicode.utf8ValidateSlice(result.text));
+
+    // Confidences and timesteps arrays should match in length.
+    try testing.expectEqual(result.confidences.len, result.timesteps.len);
+}
+
+test "recognizeLine: solid black image" {
+    // Load the eng.traineddata model.
+    const file = std.fs.cwd().openFile("test/testdata/eng.traineddata", .{}) catch |err| {
+        std.debug.print("Skipping test: cannot open test file: {}\n", .{err});
+        return;
+    };
+    defer file.close();
+
+    const data = file.readToEndAlloc(test_allocator, 16 * 1024 * 1024) catch |err| {
+        std.debug.print("Skipping test: cannot read test file: {}\n", .{err});
+        return;
+    };
+    defer test_allocator.free(data);
+
+    var model = LSTMRecognizer.load(test_allocator, data) catch |err| {
+        std.debug.print("Skipping test: cannot load model: {}\n", .{err});
+        return;
+    };
+    defer model.deinit();
+
+    // Solid black image (0 = black).
+    const img_w: usize = 80;
+    const img_h: usize = 36;
+    var pixels: [img_w * img_h]u8 = undefined;
+    @memset(&pixels, 0);
+
+    var result = try recognizeLine(test_allocator, &model, &pixels, img_w, img_h);
+    defer result.deinit();
+
+    // Should produce valid UTF-8 and not crash.
+    try testing.expect(std.unicode.utf8ValidateSlice(result.text));
+    try testing.expectEqual(result.confidences.len, result.timesteps.len);
+}
+
+test "RecognitionResult: deinit frees all memory" {
+    // Allocate a result manually and verify deinit cleans up without leaks.
+    // The testing allocator will catch any leaks.
+    const text = try test_allocator.alloc(u8, 5);
+    @memcpy(text, "hello");
+    const confs = try test_allocator.alloc(f32, 3);
+    const ts = try test_allocator.alloc(u32, 3);
+
+    var result = RecognitionResult{
+        .text = text,
+        .confidences = confs,
+        .timesteps = ts,
+        .allocator = test_allocator,
+    };
+    result.deinit();
+    // If we get here without the testing allocator complaining, all memory was freed.
 }
