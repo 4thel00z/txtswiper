@@ -105,6 +105,89 @@ pub const Pix = struct {
         };
     }
 
+    /// Compute the optimal Otsu threshold for a single-channel grayscale image.
+    /// Returns a threshold value in [0, 255].
+    pub fn otsuThreshold(self: *const Pix) !u8 {
+        if (self.channels != 1) return error.NotGrayscale;
+
+        const n = self.data.len;
+        if (n == 0) return 0;
+
+        // Step 1: build 256-bin histogram
+        var hist: [256]u32 = [_]u32{0} ** 256;
+        for (self.data) |px| {
+            hist[px] += 1;
+        }
+
+        // Step 2: find threshold that maximizes between-class variance
+        const total: u64 = n;
+        var sum_total: u64 = 0;
+        for (0..256) |i| {
+            sum_total += @as(u64, i) * @as(u64, hist[i]);
+        }
+
+        var sum_bg: u64 = 0;
+        var weight_bg: u64 = 0;
+        var best_sigma: u128 = 0;
+        var best_t: u8 = 0;
+
+        for (0..256) |t| {
+            weight_bg += hist[t];
+            if (weight_bg == 0) continue;
+            const weight_fg = total - weight_bg;
+            if (weight_fg == 0) break;
+
+            sum_bg += @as(u64, t) * @as(u64, hist[t]);
+            const sum_fg = sum_total - sum_bg;
+
+            // sigma_B^2 = w0 * w1 * (mu1 - mu0)^2
+            // To avoid floating point, compute:
+            //   mu0 = sum_bg / weight_bg,  mu1 = sum_fg / weight_fg
+            //   (mu1 - mu0) = (sum_fg * weight_bg - sum_bg * weight_fg) / (weight_bg * weight_fg)
+            //   sigma_B^2 * weight_bg * weight_fg = (sum_fg * weight_bg - sum_bg * weight_fg)^2 / (weight_bg * weight_fg)
+            // We maximize: (sum_fg * weight_bg - sum_bg * weight_fg)^2 / (weight_bg * weight_fg)
+            // which is equivalent since the denominator is always positive.
+            // But to avoid overflow with large images, use u128.
+            const a: i128 = @as(i128, @intCast(sum_fg)) * @as(i128, @intCast(weight_bg));
+            const b: i128 = @as(i128, @intCast(sum_bg)) * @as(i128, @intCast(weight_fg));
+            const diff = a - b;
+            const numerator: u128 = @intCast(diff * diff);
+            const denominator: u128 = @as(u128, weight_bg) * @as(u128, weight_fg);
+            // Compare: numerator / denominator > best_sigma
+            // => numerator > best_sigma * denominator  (avoids division)
+            const sigma = numerator / denominator;
+            if (sigma > best_sigma) {
+                best_sigma = sigma;
+                best_t = @intCast(t);
+            }
+        }
+
+        return best_t;
+    }
+
+    /// Apply Otsu thresholding to produce a binary (1-channel) image.
+    /// Pixels above the threshold become 255, at or below become 0.
+    pub fn binarize(self: *const Pix, allocator: Allocator) !Pix {
+        // If not already grayscale, convert first
+        if (self.channels != 1) return error.NotGrayscale;
+
+        const t = try self.otsuThreshold();
+        const len = self.width * self.height;
+        const data = try allocator.alloc(u8, len);
+
+        for (0..len) |i| {
+            data[i] = if (self.data[i] > t) 255 else 0;
+        }
+
+        return .{
+            .width = self.width,
+            .height = self.height,
+            .channels = 1,
+            .data = data,
+            .allocator = allocator,
+        };
+    }
+
     /// Free pixel data.
     pub fn deinit(self: *Pix) void {
         self.allocator.free(self.data);
@@ -219,4 +302,107 @@ test "toGrayscale: already grayscale returns copy" {
 test "loadFromFile: nonexistent file returns error" {
     const result = Pix.loadFromFile(std.testing.allocator, "__nonexistent_test_file__.png");
     try std.testing.expectError(error.ImageLoadFailed, result);
+}
+
+// ── Otsu binarization tests ──────────────────────────────────────────────
+
+test "otsuThreshold: bimodal image" {
+    const alloc = std.testing.allocator;
+    const size = 200;
+    const data = try alloc.alloc(u8, size);
+    defer alloc.free(data);
+
+    // Half at 50, half at 200
+    for (0..100) |i| data[i] = 50;
+    for (100..200) |i| data[i] = 200;
+
+    const pix = Pix{
+        .width = 10,
+        .height = 20,
+        .channels = 1,
+        .data = data,
+        .allocator = alloc,
+    };
+    // Don't deinit pix — we manage data ourselves with defer above
+
+    const t = try pix.otsuThreshold();
+    // Otsu finds the threshold that maximally separates the two classes.
+    // For two equal-sized groups at 50 and 200, the best split is at 50
+    // (puts group-50 in background and group-200 in foreground).
+    try std.testing.expect(t >= 50 and t < 200);
+}
+
+test "binarize: correct output" {
+    const alloc = std.testing.allocator;
+    const data = try alloc.alloc(u8, 4);
+    data[0] = 30;
+    data[1] = 80;
+    data[2] = 170;
+    data[3] = 220;
+
+    var pix = Pix{
+        .width = 2,
+        .height = 2,
+        .channels = 1,
+        .data = data,
+        .allocator = alloc,
+    };
+    defer pix.deinit();
+
+    var bin = try pix.binarize(alloc);
+    defer bin.deinit();
+
+    // All pixels should be 0 or 255
+    for (bin.data) |px| {
+        try std.testing.expect(px == 0 or px == 255);
+    }
+
+    // Threshold should split somewhere in the middle;
+    // 30 and 80 should be dark, 170 and 220 should be bright
+    try std.testing.expectEqual(@as(u8, 0), bin.data[0]); // 30
+    try std.testing.expectEqual(@as(u8, 0), bin.data[1]); // 80
+    try std.testing.expectEqual(@as(u8, 255), bin.data[2]); // 170
+    try std.testing.expectEqual(@as(u8, 255), bin.data[3]); // 220
+}
+
+test "otsuThreshold: uniform image" {
+    const alloc = std.testing.allocator;
+    const data = try alloc.alloc(u8, 100);
+    defer alloc.free(data);
+
+    @memset(data, 128);
+
+    const pix = Pix{
+        .width = 10,
+        .height = 10,
+        .channels = 1,
+        .data = data,
+        .allocator = alloc,
+    };
+
+    // Should not error; any threshold is valid
+    const t = try pix.otsuThreshold();
+    _ = t;
+}
+
+test "otsuThreshold: gradient image" {
+    const alloc = std.testing.allocator;
+    const size: usize = 256;
+    const data = try alloc.alloc(u8, size);
+    defer alloc.free(data);
+
+    // One pixel of each value 0..255
+    for (0..size) |i| data[i] = @intCast(i);
+
+    const pix = Pix{
+        .width = 16,
+        .height = 16,
+        .channels = 1,
+        .data = data,
+        .allocator = alloc,
+    };
+
+    const t = try pix.otsuThreshold();
+    // For a uniform histogram, Otsu should land near the midpoint
+    try std.testing.expect(t >= 100 and t <= 155);
 }
