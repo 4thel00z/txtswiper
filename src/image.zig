@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const NetworkIO = @import("network.zig").NetworkIO;
 
 const c = @cImport({
     @cInclude("stb_image.h");
@@ -342,6 +343,97 @@ pub const Pix = struct {
         }
         // Rotate by the negative of the detected skew to correct it
         return self.rotate(-angle, allocator);
+    }
+
+    /// Prepare image for LSTM input. Scales to target_height preserving aspect
+    /// ratio, normalizes pixel values to [-1, 1], and packs into a NetworkIO
+    /// with 2D stride layout for the Conv->Maxpool->XYTranspose->LSTM pipeline.
+    /// If multi-channel, automatically converts to grayscale first.
+    /// Caller owns the returned NetworkIO and must call deinit() on it.
+    pub fn prepareLSTMInput(self: *const Pix, allocator: Allocator, target_height: usize) !NetworkIO {
+        if (self.width == 0 or self.height == 0 or target_height == 0) {
+            return NetworkIO.init(allocator, 0, 1, false);
+        }
+
+        // If multi-channel, convert to grayscale first.
+        var gray_pix: ?Pix = null;
+        defer if (gray_pix) |*gp| gp.deinit();
+
+        const gray_data: []const u8 = if (self.channels > 1) blk: {
+            gray_pix = try self.toGrayscale(allocator);
+            break :blk gray_pix.?.data;
+        } else self.data;
+
+        const width: usize = @intCast(self.width);
+        const height: usize = @intCast(self.height);
+
+        // Compute scaled width preserving aspect ratio (with rounding).
+        const scaled_width = (width * target_height + height / 2) / height;
+        if (scaled_width == 0) {
+            return NetworkIO.init(allocator, 0, 1, false);
+        }
+
+        // Allocate NetworkIO with 2D stride: [target_height * scaled_width][1].
+        var nio = try NetworkIO.init2D(allocator, target_height, scaled_width, 1, false);
+        errdefer nio.deinit();
+
+        const buf = nio.f_data.?;
+
+        // Compute adaptive normalization: global min/max for contrast stretching.
+        var min_pixel: f32 = 255.0;
+        var max_pixel: f32 = 0.0;
+        for (gray_data) |p| {
+            const v: f32 = @floatFromInt(p);
+            if (v < min_pixel) min_pixel = v;
+            if (v > max_pixel) max_pixel = v;
+        }
+        const black = min_pixel;
+        var contrast = (max_pixel - black) / 2.0;
+        if (contrast <= 0.0) contrast = 1.0;
+
+        // Fill the NetworkIO: row-major (y then x).
+        // Timestep t = y * scaled_width + x, 1 feature per timestep.
+        for (0..target_height) |y| {
+            for (0..scaled_width) |x| {
+                // Map scaled (x, y) back to source coordinates via bilinear interpolation.
+                const src_xf: f32 = if (scaled_width > 1)
+                    @as(f32, @floatFromInt(x)) * @as(f32, @floatFromInt(width - 1)) / @as(f32, @floatFromInt(scaled_width - 1))
+                else
+                    @as(f32, @floatFromInt(width - 1)) * 0.5;
+
+                const src_yf: f32 = if (target_height > 1)
+                    @as(f32, @floatFromInt(y)) * @as(f32, @floatFromInt(height - 1)) / @as(f32, @floatFromInt(target_height - 1))
+                else
+                    @as(f32, @floatFromInt(height - 1)) * 0.5;
+
+                // Bilinear interpolation.
+                const x0: usize = @intFromFloat(@floor(src_xf));
+                const y0: usize = @intFromFloat(@floor(src_yf));
+                const x1: usize = @min(x0 + 1, width - 1);
+                const y1: usize = @min(y0 + 1, height - 1);
+
+                const dx = src_xf - @as(f32, @floatFromInt(x0));
+                const dy = src_yf - @as(f32, @floatFromInt(y0));
+
+                const p00: f32 = @floatFromInt(gray_data[y0 * width + x0]);
+                const p10: f32 = @floatFromInt(gray_data[y0 * width + x1]);
+                const p01: f32 = @floatFromInt(gray_data[y1 * width + x0]);
+                const p11: f32 = @floatFromInt(gray_data[y1 * width + x1]);
+
+                const val = p00 * (1.0 - dx) * (1.0 - dy) +
+                    p10 * dx * (1.0 - dy) +
+                    p01 * (1.0 - dx) * dy +
+                    p11 * dx * dy;
+
+                // Normalize: (pixel - black) / contrast - 1.0  (maps to [-1, 1])
+                const normalized = (val - black) / contrast - 1.0;
+
+                const t = y * scaled_width + x;
+                buf[t] = normalized;
+            }
+        }
+
+        return nio;
     }
 
     /// Free pixel data.
@@ -765,4 +857,229 @@ test "rotate: non-grayscale returns error" {
     };
 
     try std.testing.expectError(error.NotGrayscale, pix.rotate(5.0, alloc));
+}
+
+// ── prepareLSTMInput tests ───────────────────────────────────────────────
+
+test "prepareLSTMInput: dimensions correct for grayscale image" {
+    const alloc = std.testing.allocator;
+    // Create a 100x50 grayscale image with a gradient pattern
+    const w: usize = 100;
+    const h: usize = 50;
+    const data = try alloc.alloc(u8, w * h);
+
+    for (0..w * h) |i| {
+        data[i] = @intCast(i % 256);
+    }
+
+    var pix = Pix{
+        .width = @intCast(w),
+        .height = @intCast(h),
+        .channels = 1,
+        .data = data,
+        .allocator = alloc,
+    };
+    defer pix.deinit();
+
+    const target_height: usize = 36;
+    var nio = try pix.prepareLSTMInput(alloc, target_height);
+    defer nio.deinit();
+
+    // scaled_width = (100 * 36 + 25) / 50 = 3625 / 50 = 72 (with rounding)
+    const expected_sw = (w * target_height + h / 2) / h;
+    try std.testing.expectEqual(target_height, nio.getStrideHeight());
+    try std.testing.expectEqual(expected_sw, nio.getStrideWidth());
+    try std.testing.expectEqual(target_height * expected_sw, nio.width());
+    try std.testing.expectEqual(@as(usize, 1), nio.numFeatures());
+}
+
+test "prepareLSTMInput: output values in [-1, 1] range" {
+    const alloc = std.testing.allocator;
+    // 4x4 image with known values covering a range
+    const w: usize = 4;
+    const h: usize = 4;
+    const data = try alloc.alloc(u8, w * h);
+
+    // Set up a range of pixel values: 10, 50, 100, 200, etc.
+    data[0] = 10;
+    data[1] = 50;
+    data[2] = 100;
+    data[3] = 200;
+    data[4] = 30;
+    data[5] = 80;
+    data[6] = 150;
+    data[7] = 250;
+    data[8] = 10;
+    data[9] = 60;
+    data[10] = 120;
+    data[11] = 200;
+    data[12] = 20;
+    data[13] = 90;
+    data[14] = 180;
+    data[15] = 250;
+
+    var pix = Pix{
+        .width = @intCast(w),
+        .height = @intCast(h),
+        .channels = 1,
+        .data = data,
+        .allocator = alloc,
+    };
+    defer pix.deinit();
+
+    var nio = try pix.prepareLSTMInput(alloc, 4);
+    defer nio.deinit();
+
+    const buf = nio.f_data.?;
+    for (buf) |v| {
+        try std.testing.expect(v >= -1.0 - 1e-6);
+        try std.testing.expect(v <= 1.0 + 1e-6);
+    }
+
+    // Min pixel (10) should map to -1.0, max pixel (250) should map to 1.0
+    // Since we scale to the same dimensions (4x4 -> 4x4), corner values should be exact.
+    // black = 10, contrast = (250-10)/2 = 120
+    // min normalized = (10-10)/120 - 1.0 = -1.0
+    // max normalized = (250-10)/120 - 1.0 = 240/120 - 1.0 = 2.0 - 1.0 = 1.0
+    // Verify the extreme values exist somewhere in output
+    var found_min = false;
+    var found_max = false;
+    for (buf) |v| {
+        if (@abs(v - (-1.0)) < 0.01) found_min = true;
+        if (@abs(v - 1.0) < 0.01) found_max = true;
+    }
+    try std.testing.expect(found_min);
+    try std.testing.expect(found_max);
+}
+
+test "prepareLSTMInput: auto-converts RGB to grayscale" {
+    const alloc = std.testing.allocator;
+    // 4x4 RGB image
+    const w: usize = 4;
+    const h: usize = 4;
+    const data = try alloc.alloc(u8, w * h * 3);
+
+    // Fill with a simple pattern: (128, 128, 128) everywhere = gray
+    for (0..w * h) |i| {
+        data[i * 3 + 0] = 128; // R
+        data[i * 3 + 1] = 128; // G
+        data[i * 3 + 2] = 128; // B
+    }
+    // Make one pixel brighter and one darker for contrast
+    data[0] = 255;
+    data[1] = 255;
+    data[2] = 255; // pixel 0: white
+    data[3] = 0;
+    data[4] = 0;
+    data[5] = 0; // pixel 1: black
+
+    var pix = Pix{
+        .width = @intCast(w),
+        .height = @intCast(h),
+        .channels = 3,
+        .data = data,
+        .allocator = alloc,
+    };
+    defer pix.deinit();
+
+    // Should not error -- auto-converts to grayscale internally
+    var nio = try pix.prepareLSTMInput(alloc, 4);
+    defer nio.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), nio.getStrideHeight());
+    try std.testing.expectEqual(@as(usize, 4), nio.getStrideWidth());
+    try std.testing.expectEqual(@as(usize, 1), nio.numFeatures());
+
+    // Verify values are in [-1, 1]
+    const buf = nio.f_data.?;
+    for (buf) |v| {
+        try std.testing.expect(v >= -1.0 - 1e-6);
+        try std.testing.expect(v <= 1.0 + 1e-6);
+    }
+}
+
+test "prepareLSTMInput: empty image returns zero-width NetworkIO" {
+    const alloc = std.testing.allocator;
+
+    // Zero-width image
+    {
+        const data = try alloc.alloc(u8, 0);
+        var pix = Pix{
+            .width = 0,
+            .height = 10,
+            .channels = 1,
+            .data = data,
+            .allocator = alloc,
+        };
+        defer pix.deinit();
+
+        var nio = try pix.prepareLSTMInput(alloc, 36);
+        defer nio.deinit();
+
+        try std.testing.expectEqual(@as(usize, 0), nio.width());
+    }
+
+    // Zero-height image
+    {
+        const data = try alloc.alloc(u8, 0);
+        var pix = Pix{
+            .width = 10,
+            .height = 0,
+            .channels = 1,
+            .data = data,
+            .allocator = alloc,
+        };
+        defer pix.deinit();
+
+        var nio = try pix.prepareLSTMInput(alloc, 36);
+        defer nio.deinit();
+
+        try std.testing.expectEqual(@as(usize, 0), nio.width());
+    }
+
+    // Zero target height
+    {
+        const data = try alloc.alloc(u8, 100);
+        @memset(data, 128);
+        var pix = Pix{
+            .width = 10,
+            .height = 10,
+            .channels = 1,
+            .data = data,
+            .allocator = alloc,
+        };
+        defer pix.deinit();
+
+        var nio = try pix.prepareLSTMInput(alloc, 0);
+        defer nio.deinit();
+
+        try std.testing.expectEqual(@as(usize, 0), nio.width());
+    }
+}
+
+test "prepareLSTMInput: uniform image produces all -1.0 values" {
+    const alloc = std.testing.allocator;
+    // All pixels same value => min == max => contrast = 1.0
+    // normalized = (128 - 128) / 1.0 - 1.0 = -1.0
+    const w: usize = 8;
+    const h: usize = 8;
+    const data = try alloc.alloc(u8, w * h);
+    @memset(data, 128);
+
+    var pix = Pix{
+        .width = @intCast(w),
+        .height = @intCast(h),
+        .channels = 1,
+        .data = data,
+        .allocator = alloc,
+    };
+    defer pix.deinit();
+
+    var nio = try pix.prepareLSTMInput(alloc, 4);
+    defer nio.deinit();
+
+    const buf = nio.f_data.?;
+    for (buf) |v| {
+        try std.testing.expect(@abs(v - (-1.0)) < 1e-6);
+    }
 }
