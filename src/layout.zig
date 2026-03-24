@@ -1690,3 +1690,107 @@ test "detectColumns: mixed width lines that still overlap → 1 block" {
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqual(@as(usize, 3), blocks[0].lines.len);
 }
+
+// ── Integration Test ────────────────────────────────────────────────────────
+
+test "full layout pipeline: synthetic document with two text lines" {
+    const alloc = std.testing.allocator;
+
+    // Build a 200x100 binary image with two lines of "text" blobs.
+    // Line 1 (y=10..25): three blobs at x=10, 30, 50 (like 3 characters)
+    // Line 2 (y=50..65): two blobs at x=10, 30, then gap, then one at x=80 (2 words)
+    const W: u32 = 200;
+    const H: u32 = 100;
+    const pixels = try alloc.alloc(u8, W * H);
+    defer alloc.free(pixels);
+    @memset(pixels, 255); // white background
+
+    // Helper: draw a filled rectangle of dark pixels (0).
+    const drawRect = struct {
+        fn f(buf: []u8, w: u32, x0: u32, y0: u32, rw: u32, rh: u32) void {
+            for (y0..y0 + rh) |y| {
+                for (x0..x0 + rw) |x| {
+                    buf[y * w + x] = 0;
+                }
+            }
+        }
+    }.f;
+
+    // Line 1: three character-like blobs (10x15 each, spaced 2px apart)
+    drawRect(pixels, W, 10, 10, 10, 15); // "char" at (10,10)  right=20
+    drawRect(pixels, W, 22, 10, 10, 15); // "char" at (22,10)  right=32, gap=2
+    drawRect(pixels, W, 34, 10, 10, 15); // "char" at (34,10)  right=44, gap=2
+
+    // Line 2: two chars close (gap=2), then big gap (50px), then one char (= 2 words)
+    drawRect(pixels, W, 10, 50, 10, 15); // word1 char1, right=20
+    drawRect(pixels, W, 22, 50, 10, 15); // word1 char2, right=32, gap=2
+    drawRect(pixels, W, 82, 50, 10, 15); // word2 char1, gap=50
+
+    // 1. Extract connected components
+    const components = try extractComponents(alloc, pixels, W, H);
+    defer alloc.free(components);
+    try std.testing.expectEqual(@as(usize, 6), components.len);
+
+    // 2. Classify blobs
+    const blobs = try classifyBlobs(alloc, components);
+    defer alloc.free(blobs);
+    try std.testing.expectEqual(@as(usize, 6), blobs.len);
+
+    // All blobs should be text-sized (similar heights)
+    for (blobs) |b| {
+        try std.testing.expectEqual(BlobType.text, b.blob_type);
+    }
+
+    // 3. Filter to text blobs only
+    const text_blobs = try filterTextBlobs(alloc, blobs);
+    defer alloc.free(text_blobs);
+    try std.testing.expectEqual(@as(usize, 6), text_blobs.len);
+
+    // 4. Detect text lines
+    const lines = try detectTextLines(alloc, text_blobs);
+
+    // Verify line structure before passing ownership to detectColumns.
+    // If any assertion fails, we need to clean up lines ourselves.
+    var lines_owned = true;
+    defer {
+        if (lines_owned) {
+            for (lines) |*l| {
+                var line = l.*;
+                line.deinit();
+            }
+            alloc.free(lines);
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    try std.testing.expectEqual(@as(usize, 3), lines[0].blobs.len);
+    try std.testing.expectEqual(@as(usize, 3), lines[1].blobs.len);
+
+    // Verify lines are sorted top-to-bottom
+    try std.testing.expect(lines[0].y_min < lines[1].y_min);
+
+    // Baseline slope should be ~0 (horizontal text)
+    try std.testing.expect(@abs(lines[0].baseline_slope) < 0.1);
+    try std.testing.expect(@abs(lines[1].baseline_slope) < 0.1);
+
+    // 5. Word segmentation on line 2 (should have 2 words: close pair + isolated char)
+    const words = try segmentWords(alloc, &lines[1]);
+    defer alloc.free(words);
+    try std.testing.expectEqual(@as(usize, 2), words.len);
+    try std.testing.expectEqual(@as(usize, 2), words[0].blobs.len); // first word: 2 chars
+    try std.testing.expectEqual(@as(usize, 1), words[1].blobs.len); // second word: 1 char
+
+    // 6. Column detection (all lines in same x-range → 1 block)
+    // detectColumns takes ownership of lines
+    lines_owned = false;
+    const blocks = try detectColumns(alloc, lines);
+    defer {
+        for (blocks) |*b| {
+            var block = b.*;
+            block.deinit();
+        }
+        alloc.free(blocks);
+    }
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqual(@as(usize, 2), blocks[0].lines.len);
+}
