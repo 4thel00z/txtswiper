@@ -551,6 +551,145 @@ pub fn detectTextLines(allocator: Allocator, blobs: []const Blob) ![]TextLine {
     return lines;
 }
 
+// ── Word Segmentation ────────────────────────────────────────────────────────
+
+pub const Word = struct {
+    blobs: []const Blob, // slice into the line's blob array (not owned)
+    bbox: BoundingBox, // bounding box of all blobs in the word
+};
+
+/// Segment a text line into words based on inter-blob gap analysis.
+/// The blobs in the text line must be sorted left-to-right.
+/// Returns an array of Words (caller owns the array, not the blob data).
+pub fn segmentWords(allocator: Allocator, line: *const TextLine) ![]Word {
+    const blobs = line.blobs;
+
+    // 0 blobs → 0 words
+    if (blobs.len == 0) return try allocator.alloc(Word, 0);
+
+    // 1 blob → 1 word
+    if (blobs.len == 1) {
+        const words = try allocator.alloc(Word, 1);
+        words[0] = .{
+            .blobs = blobs[0..1],
+            .bbox = blobs[0].component.bbox,
+        };
+        return words;
+    }
+
+    // Step 1: Compute inter-blob gaps
+    const n_gaps = blobs.len - 1;
+    const gaps = try allocator.alloc(i32, n_gaps);
+    defer allocator.free(gaps);
+
+    for (0..n_gaps) |i| {
+        const right_edge: i32 = @intCast(blobs[i].component.bbox.right());
+        const left_edge: i32 = @intCast(blobs[i + 1].component.bbox.x);
+        gaps[i] = left_edge - right_edge;
+    }
+
+    // Compute median blob width for fallback threshold
+    const widths = try allocator.alloc(u32, blobs.len);
+    defer allocator.free(widths);
+    for (blobs, 0..) |b, i| {
+        widths[i] = b.component.bbox.width;
+    }
+    std.mem.sort(u32, widths, {}, std.sort.asc(u32));
+    const median_blob_width: f64 = blk: {
+        const mid = widths.len / 2;
+        if (widths.len % 2 == 1) {
+            break :blk @as(f64, @floatFromInt(widths[mid]));
+        } else {
+            const a: f64 = @floatFromInt(widths[mid - 1]);
+            const b: f64 = @floatFromInt(widths[mid]);
+            break :blk (a + b) / 2.0;
+        }
+    };
+
+    // Step 2: Determine space threshold
+    const threshold: f64 = thr: {
+        // Sort a copy of gaps to find the max jump
+        const sorted_gaps = try allocator.alloc(i32, n_gaps);
+        defer allocator.free(sorted_gaps);
+        @memcpy(sorted_gaps, gaps);
+        std.mem.sort(i32, sorted_gaps, {}, std.sort.asc(i32));
+
+        // Fallback for 1-2 gaps: use median_blob_width * 0.5
+        if (n_gaps <= 2) {
+            break :thr median_blob_width * 0.5;
+        }
+
+        // Find the largest jump between consecutive sorted gaps
+        var max_jump: f64 = 0;
+        var max_jump_idx: usize = 0;
+        for (0..n_gaps - 1) |i| {
+            const jump: f64 = @as(f64, @floatFromInt(sorted_gaps[i + 1])) - @as(f64, @floatFromInt(sorted_gaps[i]));
+            if (jump > max_jump) {
+                max_jump = jump;
+                max_jump_idx = i;
+            }
+        }
+
+        // If no clear jump, treat as single word
+        if (max_jump < median_blob_width * 0.3) {
+            break :thr @as(f64, @floatFromInt(sorted_gaps[n_gaps - 1])) + 1.0;
+        }
+
+        // Threshold = midpoint of the jump
+        const lo: f64 = @floatFromInt(sorted_gaps[max_jump_idx]);
+        const hi: f64 = @floatFromInt(sorted_gaps[max_jump_idx + 1]);
+        break :thr (lo + hi) / 2.0;
+    };
+
+    // Step 3: Segment into words by walking gaps
+    var word_list = std.ArrayList(Word).init(allocator);
+    defer word_list.deinit();
+
+    var word_start: usize = 0;
+
+    for (0..n_gaps) |i| {
+        const gap_f: f64 = @floatFromInt(gaps[i]);
+        if (gap_f >= threshold) {
+            // End current word at blob i, start new word at blob i+1
+            try word_list.append(buildWord(blobs[word_start .. i + 1]));
+            word_start = i + 1;
+        }
+    }
+
+    // Final word
+    try word_list.append(buildWord(blobs[word_start..blobs.len]));
+
+    return try word_list.toOwnedSlice();
+}
+
+/// Build a Word from a slice of blobs, computing the union bounding box.
+fn buildWord(blobs: []const Blob) Word {
+    std.debug.assert(blobs.len > 0);
+
+    var x_min: u32 = blobs[0].component.bbox.x;
+    var y_min: u32 = blobs[0].component.bbox.y;
+    var x_max: u32 = blobs[0].component.bbox.right();
+    var y_max: u32 = blobs[0].component.bbox.bottom();
+
+    for (blobs[1..]) |b| {
+        const bbox = b.component.bbox;
+        if (bbox.x < x_min) x_min = bbox.x;
+        if (bbox.y < y_min) y_min = bbox.y;
+        if (bbox.right() > x_max) x_max = bbox.right();
+        if (bbox.bottom() > y_max) y_max = bbox.bottom();
+    }
+
+    return .{
+        .blobs = blobs,
+        .bbox = .{
+            .x = x_min,
+            .y = y_min,
+            .width = x_max - x_min,
+            .height = y_max - y_min,
+        },
+    };
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 test "single blob: 3x3 square in 5x5 image" {
@@ -1004,4 +1143,177 @@ test "detectTextLines: empty input" {
     defer alloc.free(lines);
 
     try std.testing.expectEqual(@as(usize, 0), lines.len);
+}
+
+// ── Word Segmentation Tests ─────────────────────────────────────────────────
+
+fn makeWordTestLine(allocator: Allocator, blobs: []const Blob) TextLine {
+    return .{
+        .blobs = @constCast(blobs),
+        .y_min = 0,
+        .y_max = 20,
+        .baseline_slope = 0,
+        .baseline_intercept = 20,
+        .allocator = allocator,
+    };
+}
+
+test "segmentWords: single word (3 blobs, small uniform gaps)" {
+    const alloc = std.testing.allocator;
+
+    // 3 blobs with small gaps of 2px between them
+    const blobs = [_]Blob{
+        makeTextBlob(1, 10, 0, 12, 20), // right = 22
+        makeTextBlob(2, 24, 0, 12, 20), // gap = 2, right = 36
+        makeTextBlob(3, 38, 0, 12, 20), // gap = 2, right = 50
+    };
+
+    var line = makeWordTestLine(alloc, &blobs);
+    const words = try segmentWords(alloc, &line);
+    defer alloc.free(words);
+
+    try std.testing.expectEqual(@as(usize, 1), words.len);
+    try std.testing.expectEqual(@as(usize, 3), words[0].blobs.len);
+    try std.testing.expectEqual(@as(u32, 10), words[0].bbox.x);
+    try std.testing.expectEqual(@as(u32, 40), words[0].bbox.width); // 50 - 10
+}
+
+test "segmentWords: two words (5 blobs, large gap in middle)" {
+    const alloc = std.testing.allocator;
+
+    // Word 1: blobs at 10, 24, 38 (gaps of 2)
+    // Word 2: blobs at 80, 94 (gap of 2)
+    // Gap between words: 80 - 50 = 30 (large)
+    const blobs = [_]Blob{
+        makeTextBlob(1, 10, 0, 12, 20), // right = 22
+        makeTextBlob(2, 24, 0, 12, 20), // gap = 2, right = 36
+        makeTextBlob(3, 38, 0, 12, 20), // gap = 2, right = 50
+        makeTextBlob(4, 80, 0, 12, 20), // gap = 30, right = 92
+        makeTextBlob(5, 94, 0, 12, 20), // gap = 2, right = 106
+    };
+
+    var line = makeWordTestLine(alloc, &blobs);
+    const words = try segmentWords(alloc, &line);
+    defer alloc.free(words);
+
+    try std.testing.expectEqual(@as(usize, 2), words.len);
+    try std.testing.expectEqual(@as(usize, 3), words[0].blobs.len);
+    try std.testing.expectEqual(@as(usize, 2), words[1].blobs.len);
+
+    // First word bbox
+    try std.testing.expectEqual(@as(u32, 10), words[0].bbox.x);
+    try std.testing.expectEqual(@as(u32, 40), words[0].bbox.width);
+
+    // Second word bbox
+    try std.testing.expectEqual(@as(u32, 80), words[1].bbox.x);
+    try std.testing.expectEqual(@as(u32, 26), words[1].bbox.width); // 106 - 80
+}
+
+test "segmentWords: uniform large gaps → single word (no bimodal split)" {
+    const alloc = std.testing.allocator;
+
+    // 4 blobs with identical large gaps (100px each).
+    // sorted gaps = [100, 100, 100], max_jump = 0 < median_width*0.3
+    // No bimodal separation → algorithm correctly treats as single word.
+    const blobs = [_]Blob{
+        makeTextBlob(1, 0, 0, 10, 20), // right = 10
+        makeTextBlob(2, 110, 0, 10, 20), // gap = 100
+        makeTextBlob(3, 220, 0, 10, 20), // gap = 100
+        makeTextBlob(4, 330, 0, 10, 20), // gap = 100
+    };
+
+    var line = makeWordTestLine(alloc, &blobs);
+    const words = try segmentWords(alloc, &line);
+    defer alloc.free(words);
+
+    try std.testing.expectEqual(@as(usize, 1), words.len);
+    try std.testing.expectEqual(@as(usize, 4), words[0].blobs.len);
+}
+
+test "segmentWords: fallback threshold splits two groups" {
+    const alloc = std.testing.allocator;
+
+    // 3 blobs, 2 gaps → fallback path (n_gaps <= 2).
+    // threshold = median_blob_width * 0.5 = 5 * 0.5 = 2.5
+    // gap0 = 2 < 2.5 → same word; gap1 = 50 >= 2.5 → new word.
+    const blobs = [_]Blob{
+        makeTextBlob(1, 0, 0, 5, 20), // right = 5
+        makeTextBlob(2, 7, 0, 5, 20), // gap = 2, right = 12
+        makeTextBlob(3, 62, 0, 5, 20), // gap = 50, right = 67
+    };
+
+    var line = makeWordTestLine(alloc, &blobs);
+    const words = try segmentWords(alloc, &line);
+    defer alloc.free(words);
+
+    try std.testing.expectEqual(@as(usize, 2), words.len);
+    try std.testing.expectEqual(@as(usize, 2), words[0].blobs.len);
+    try std.testing.expectEqual(@as(usize, 1), words[1].blobs.len);
+}
+
+test "segmentWords: single blob → single word" {
+    const alloc = std.testing.allocator;
+
+    const blobs = [_]Blob{
+        makeTextBlob(1, 42, 5, 15, 20),
+    };
+
+    var line = makeWordTestLine(alloc, &blobs);
+    const words = try segmentWords(alloc, &line);
+    defer alloc.free(words);
+
+    try std.testing.expectEqual(@as(usize, 1), words.len);
+    try std.testing.expectEqual(@as(usize, 1), words[0].blobs.len);
+    try std.testing.expectEqual(@as(u32, 42), words[0].bbox.x);
+    try std.testing.expectEqual(@as(u32, 5), words[0].bbox.y);
+    try std.testing.expectEqual(@as(u32, 15), words[0].bbox.width);
+    try std.testing.expectEqual(@as(u32, 20), words[0].bbox.height);
+}
+
+test "segmentWords: empty line → 0 words" {
+    const alloc = std.testing.allocator;
+
+    var line = makeWordTestLine(alloc, &[_]Blob{});
+    const words = try segmentWords(alloc, &line);
+    defer alloc.free(words);
+
+    try std.testing.expectEqual(@as(usize, 0), words.len);
+}
+
+test "segmentWords: three words via clear gap jumps" {
+    const alloc = std.testing.allocator;
+
+    // Word 1: blobs at 0..12, 14..26 (gap=2)
+    // Word 2: blobs at 76..88, 90..102 (gap=2)
+    // Word 3: blobs at 152..164, 166..178 (gap=2)
+    // Inter-word gaps: 76-26=50 and 152-102=50
+    // Gaps array: [2, 50, 2, 50, 2]
+    // Sorted: [2, 2, 2, 50, 50]
+    // Max jump at index 2→3: 50-2=48, median_blob_width=12, 0.3*12=3.6, 48>3.6 → clear
+    // Threshold = (2+50)/2 = 26
+    // Walk: gap0=2<26 no break, gap1=50>=26 break, gap2=2<26 no break, gap3=50>=26 break, gap4=2<26 no break
+    // Words: [blob0,blob1], [blob2,blob3], [blob4,blob5]
+
+    const blobs = [_]Blob{
+        makeTextBlob(1, 0, 0, 12, 20), // right=12
+        makeTextBlob(2, 14, 0, 12, 20), // gap=2, right=26
+        makeTextBlob(3, 76, 0, 12, 20), // gap=50, right=88
+        makeTextBlob(4, 90, 0, 12, 20), // gap=2, right=102
+        makeTextBlob(5, 152, 0, 12, 20), // gap=50, right=164
+        makeTextBlob(6, 166, 0, 12, 20), // gap=2, right=178
+    };
+
+    var line = makeWordTestLine(alloc, &blobs);
+    const words = try segmentWords(alloc, &line);
+    defer alloc.free(words);
+
+    try std.testing.expectEqual(@as(usize, 3), words.len);
+    try std.testing.expectEqual(@as(usize, 2), words[0].blobs.len);
+    try std.testing.expectEqual(@as(usize, 2), words[1].blobs.len);
+    try std.testing.expectEqual(@as(usize, 2), words[2].blobs.len);
+
+    // Check word bboxes
+    try std.testing.expectEqual(@as(u32, 0), words[0].bbox.x);
+    try std.testing.expectEqual(@as(u32, 76), words[1].bbox.x);
+    try std.testing.expectEqual(@as(u32, 152), words[2].bbox.x);
 }
