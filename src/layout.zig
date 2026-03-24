@@ -242,6 +242,111 @@ pub fn extractComponents(allocator: Allocator, pixels: []const u8, width: u32, h
     return result;
 }
 
+// ── Blob Classification ─────────────────────────────────────────────────────
+
+pub const BlobType = enum {
+    text,
+    noise,
+    small,
+    large,
+};
+
+pub const Blob = struct {
+    component: Component,
+    blob_type: BlobType,
+};
+
+/// Classify components into text, noise, small, and large categories
+/// based on size statistics relative to the estimated median height.
+/// Returns a new array of Blobs with classification tags.
+/// If fewer than 3 components, all are classified as text.
+pub fn classifyBlobs(allocator: Allocator, components: []const Component) ![]Blob {
+    if (components.len == 0) return try allocator.alloc(Blob, 0);
+
+    const blobs = try allocator.alloc(Blob, components.len);
+    errdefer allocator.free(blobs);
+
+    // Fewer than 3 components: not enough data for statistics, classify all as text
+    if (components.len < 3) {
+        for (components, 0..) |comp, i| {
+            blobs[i] = .{ .component = comp, .blob_type = .text };
+        }
+        return blobs;
+    }
+
+    // Collect heights and sort to find the median
+    const heights = try allocator.alloc(u32, components.len);
+    defer allocator.free(heights);
+    for (components, 0..) |comp, i| {
+        heights[i] = comp.bbox.height;
+    }
+    std.mem.sort(u32, heights, {}, std.sort.asc(u32));
+
+    const median_h: f64 = blk: {
+        const mid = heights.len / 2;
+        if (heights.len % 2 == 1) {
+            break :blk @as(f64, @floatFromInt(heights[mid]));
+        } else {
+            const a: f64 = @floatFromInt(heights[mid - 1]);
+            const b: f64 = @floatFromInt(heights[mid]);
+            break :blk (a + b) / 2.0;
+        }
+    };
+
+    // Classification thresholds
+    const noise_h = median_h * 0.25;
+    const small_h = median_h * 0.5;
+    const text_max_h = median_h * 3.0;
+    const text_max_w = median_h * 10.0;
+    const min_fill_ratio: f64 = 0.1;
+
+    for (components, 0..) |comp, i| {
+        const h: f64 = @floatFromInt(comp.bbox.height);
+        const w: f64 = @floatFromInt(comp.bbox.width);
+        const bbox_area = comp.bbox.area();
+        const fill_ratio: f64 = if (bbox_area > 0)
+            @as(f64, @floatFromInt(comp.pixel_count)) / @as(f64, @floatFromInt(bbox_area))
+        else
+            0.0;
+
+        // Area ratio filter: very low fill → noise regardless of size
+        if (fill_ratio < min_fill_ratio) {
+            blobs[i] = .{ .component = comp, .blob_type = .noise };
+            continue;
+        }
+
+        if (h < noise_h) {
+            blobs[i] = .{ .component = comp, .blob_type = .noise };
+        } else if (h < small_h) {
+            blobs[i] = .{ .component = comp, .blob_type = .small };
+        } else if (h <= text_max_h and w <= text_max_w) {
+            blobs[i] = .{ .component = comp, .blob_type = .text };
+        } else {
+            blobs[i] = .{ .component = comp, .blob_type = .large };
+        }
+    }
+
+    return blobs;
+}
+
+/// Filter blobs, returning only those classified as text.
+pub fn filterTextBlobs(allocator: Allocator, blobs: []const Blob) ![]Blob {
+    var count: usize = 0;
+    for (blobs) |b| {
+        if (b.blob_type == .text) count += 1;
+    }
+
+    const result = try allocator.alloc(Blob, count);
+    var idx: usize = 0;
+    for (blobs) |b| {
+        if (b.blob_type == .text) {
+            result[idx] = b;
+            idx += 1;
+        }
+    }
+    return result;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 test "single blob: 3x3 square in 5x5 image" {
@@ -430,4 +535,123 @@ test "UnionFind: basic operations" {
 
     // 9 is still its own root
     try std.testing.expectEqual(@as(u32, 9), uf.find(9));
+}
+
+// ── Blob Classification Tests ───────────────────────────────────────────────
+
+test "classifyBlobs: mixed sizes" {
+    const alloc = std.testing.allocator;
+
+    // Create components with varying heights:
+    // - tiny noise (height=2), normal text (height=20, 22, 18), huge image (height=200)
+    // Sorted heights: 2, 18, 20, 22, 200 → median = 20
+    // noise_h = 5, small_h = 10, text_max_h = 60, text_max_w = 200
+    const components = [_]Component{
+        // tiny noise: height 2 < 5 → noise
+        .{ .label = 1, .bbox = .{ .x = 0, .y = 0, .width = 3, .height = 2 }, .pixel_count = 4 },
+        // normal text: height 20
+        .{ .label = 2, .bbox = .{ .x = 10, .y = 0, .width = 15, .height = 20 }, .pixel_count = 200 },
+        // normal text: height 22
+        .{ .label = 3, .bbox = .{ .x = 30, .y = 0, .width = 14, .height = 22 }, .pixel_count = 200 },
+        // normal text: height 18
+        .{ .label = 4, .bbox = .{ .x = 50, .y = 0, .width = 16, .height = 18 }, .pixel_count = 200 },
+        // huge image: height 200 > 60 → large
+        .{ .label = 5, .bbox = .{ .x = 0, .y = 30, .width = 100, .height = 200 }, .pixel_count = 15000 },
+    };
+
+    const blobs = try classifyBlobs(alloc, &components);
+    defer alloc.free(blobs);
+
+    try std.testing.expectEqual(@as(usize, 5), blobs.len);
+    try std.testing.expectEqual(BlobType.noise, blobs[0].blob_type); // height 2
+    try std.testing.expectEqual(BlobType.text, blobs[1].blob_type); // height 20
+    try std.testing.expectEqual(BlobType.text, blobs[2].blob_type); // height 22
+    try std.testing.expectEqual(BlobType.text, blobs[3].blob_type); // height 18
+    try std.testing.expectEqual(BlobType.large, blobs[4].blob_type); // height 200
+}
+
+test "classifyBlobs: all same size → all text" {
+    const alloc = std.testing.allocator;
+
+    const components = [_]Component{
+        .{ .label = 1, .bbox = .{ .x = 0, .y = 0, .width = 10, .height = 20 }, .pixel_count = 150 },
+        .{ .label = 2, .bbox = .{ .x = 15, .y = 0, .width = 10, .height = 20 }, .pixel_count = 150 },
+        .{ .label = 3, .bbox = .{ .x = 30, .y = 0, .width = 10, .height = 20 }, .pixel_count = 150 },
+        .{ .label = 4, .bbox = .{ .x = 45, .y = 0, .width = 10, .height = 20 }, .pixel_count = 150 },
+    };
+
+    const blobs = try classifyBlobs(alloc, &components);
+    defer alloc.free(blobs);
+
+    for (blobs) |b| {
+        try std.testing.expectEqual(BlobType.text, b.blob_type);
+    }
+}
+
+test "classifyBlobs: sparse component (low fill ratio) → noise" {
+    const alloc = std.testing.allocator;
+
+    // 5 components so we have enough for statistics. Median height = 20.
+    // The sparse one has a normal-sized bbox but very few pixels.
+    const components = [_]Component{
+        .{ .label = 1, .bbox = .{ .x = 0, .y = 0, .width = 10, .height = 20 }, .pixel_count = 150 },
+        .{ .label = 2, .bbox = .{ .x = 15, .y = 0, .width = 10, .height = 20 }, .pixel_count = 150 },
+        .{ .label = 3, .bbox = .{ .x = 30, .y = 0, .width = 10, .height = 20 }, .pixel_count = 150 },
+        // Sparse: 100x20 bbox = 2000 area, but only 5 pixels → fill = 0.0025 < 0.1 → noise
+        .{ .label = 4, .bbox = .{ .x = 45, .y = 0, .width = 100, .height = 20 }, .pixel_count = 5 },
+        .{ .label = 5, .bbox = .{ .x = 150, .y = 0, .width = 10, .height = 20 }, .pixel_count = 150 },
+    };
+
+    const blobs = try classifyBlobs(alloc, &components);
+    defer alloc.free(blobs);
+
+    try std.testing.expectEqual(BlobType.text, blobs[0].blob_type);
+    try std.testing.expectEqual(BlobType.text, blobs[1].blob_type);
+    try std.testing.expectEqual(BlobType.text, blobs[2].blob_type);
+    try std.testing.expectEqual(BlobType.noise, blobs[3].blob_type); // sparse
+    try std.testing.expectEqual(BlobType.text, blobs[4].blob_type);
+}
+
+test "classifyBlobs: empty input → 0 blobs" {
+    const alloc = std.testing.allocator;
+
+    const blobs = try classifyBlobs(alloc, &[_]Component{});
+    defer alloc.free(blobs);
+
+    try std.testing.expectEqual(@as(usize, 0), blobs.len);
+}
+
+test "classifyBlobs: fewer than 3 components → all text" {
+    const alloc = std.testing.allocator;
+
+    const components = [_]Component{
+        .{ .label = 1, .bbox = .{ .x = 0, .y = 0, .width = 5, .height = 3 }, .pixel_count = 10 },
+        .{ .label = 2, .bbox = .{ .x = 10, .y = 0, .width = 200, .height = 300 }, .pixel_count = 50000 },
+    };
+
+    const blobs = try classifyBlobs(alloc, &components);
+    defer alloc.free(blobs);
+
+    try std.testing.expectEqual(@as(usize, 2), blobs.len);
+    try std.testing.expectEqual(BlobType.text, blobs[0].blob_type);
+    try std.testing.expectEqual(BlobType.text, blobs[1].blob_type);
+}
+
+test "filterTextBlobs: returns only text blobs" {
+    const alloc = std.testing.allocator;
+
+    const blobs = [_]Blob{
+        .{ .component = .{ .label = 1, .bbox = .{ .x = 0, .y = 0, .width = 3, .height = 2 }, .pixel_count = 4 }, .blob_type = .noise },
+        .{ .component = .{ .label = 2, .bbox = .{ .x = 10, .y = 0, .width = 15, .height = 20 }, .pixel_count = 200 }, .blob_type = .text },
+        .{ .component = .{ .label = 3, .bbox = .{ .x = 30, .y = 0, .width = 14, .height = 22 }, .pixel_count = 200 }, .blob_type = .text },
+        .{ .component = .{ .label = 4, .bbox = .{ .x = 0, .y = 30, .width = 100, .height = 200 }, .pixel_count = 15000 }, .blob_type = .large },
+        .{ .component = .{ .label = 5, .bbox = .{ .x = 50, .y = 0, .width = 8, .height = 6 }, .pixel_count = 30 }, .blob_type = .small },
+    };
+
+    const text_blobs = try filterTextBlobs(alloc, &blobs);
+    defer alloc.free(text_blobs);
+
+    try std.testing.expectEqual(@as(usize, 2), text_blobs.len);
+    try std.testing.expectEqual(@as(u32, 2), text_blobs[0].component.label);
+    try std.testing.expectEqual(@as(u32, 3), text_blobs[1].component.label);
 }
