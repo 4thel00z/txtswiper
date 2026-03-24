@@ -690,6 +690,198 @@ fn buildWord(blobs: []const Blob) Word {
     };
 }
 
+// ── Column / Block Detection ─────────────────────────────────────────────────
+
+pub const TextBlock = struct {
+    lines: []TextLine, // owned lines in this block, sorted top-to-bottom
+    bbox: BoundingBox, // bounding box of entire block
+    allocator: Allocator,
+
+    pub fn deinit(self: *TextBlock) void {
+        for (self.lines) |*line| {
+            line.deinit();
+        }
+        self.allocator.free(self.lines);
+        self.* = undefined;
+    }
+};
+
+/// Temporary column accumulator used during column detection.
+const ColumnAccum = struct {
+    line_indices: std.ArrayList(usize),
+    x_min: u32,
+    x_max: u32,
+
+    fn init(allocator: Allocator) ColumnAccum {
+        return .{
+            .line_indices = std.ArrayList(usize).init(allocator),
+            .x_min = std.math.maxInt(u32),
+            .x_max = 0,
+        };
+    }
+
+    fn deinit(self: *ColumnAccum) void {
+        self.line_indices.deinit();
+    }
+
+    fn width(self: ColumnAccum) u32 {
+        if (self.x_max <= self.x_min) return 0;
+        return self.x_max - self.x_min;
+    }
+
+    fn avgX(self: ColumnAccum) u32 {
+        return self.x_min + self.width() / 2;
+    }
+};
+
+/// Compute the x-range of a TextLine from its leftmost to rightmost blob edge.
+fn lineXRange(line: *const TextLine) struct { x_min: u32, x_max: u32 } {
+    if (line.blobs.len == 0) return .{ .x_min = 0, .x_max = 0 };
+
+    var x_min: u32 = std.math.maxInt(u32);
+    var x_max: u32 = 0;
+
+    for (line.blobs) |blob| {
+        const bbox = blob.component.bbox;
+        if (bbox.x < x_min) x_min = bbox.x;
+        const r = bbox.right();
+        if (r > x_max) x_max = r;
+    }
+
+    return .{ .x_min = x_min, .x_max = x_max };
+}
+
+/// Detect text columns/blocks from text lines.
+/// Lines are grouped by x-range overlap into blocks.
+/// Returns blocks sorted left-to-right, lines within each block sorted top-to-bottom.
+/// Takes ownership of the TextLine array and its contents.
+/// Caller must free the returned slice and call deinit on each TextBlock.
+pub fn detectColumns(allocator: Allocator, lines: []TextLine) ![]TextBlock {
+    if (lines.len == 0) {
+        allocator.free(lines);
+        return try allocator.alloc(TextBlock, 0);
+    }
+
+    // Sort lines top-to-bottom by y_min
+    std.mem.sort(TextLine, lines, {}, struct {
+        fn lessThan(_: void, a: TextLine, b: TextLine) bool {
+            return a.y_min < b.y_min;
+        }
+    }.lessThan);
+
+    // Group lines into columns by x-range overlap
+    var columns = std.ArrayList(ColumnAccum).init(allocator);
+    defer {
+        for (columns.items) |*col| {
+            col.deinit();
+        }
+        columns.deinit();
+    }
+
+    for (lines, 0..) |*line, li| {
+        const xr = lineXRange(line);
+        const line_width = if (xr.x_max > xr.x_min) xr.x_max - xr.x_min else @as(u32, 1);
+
+        var best_col: ?usize = null;
+        var best_ratio: f64 = 0;
+
+        for (columns.items, 0..) |col, ci| {
+            const col_w = if (col.width() > 0) col.width() else @as(u32, 1);
+
+            // Compute overlap
+            const overlap_left = @max(xr.x_min, col.x_min);
+            const overlap_right = @min(xr.x_max, col.x_max);
+
+            if (overlap_right > overlap_left) {
+                const overlap: f64 = @floatFromInt(overlap_right - overlap_left);
+                const narrower: f64 = @floatFromInt(@min(line_width, col_w));
+                const ratio = overlap / narrower;
+
+                if (ratio > 0.5 and ratio > best_ratio) {
+                    best_ratio = ratio;
+                    best_col = ci;
+                }
+            }
+        }
+
+        if (best_col) |ci| {
+            try columns.items[ci].line_indices.append(li);
+            // Update column x-range to union
+            if (xr.x_min < columns.items[ci].x_min) columns.items[ci].x_min = xr.x_min;
+            if (xr.x_max > columns.items[ci].x_max) columns.items[ci].x_max = xr.x_max;
+        } else {
+            var new_col = ColumnAccum.init(allocator);
+            try new_col.line_indices.append(li);
+            new_col.x_min = xr.x_min;
+            new_col.x_max = xr.x_max;
+            try columns.append(new_col);
+        }
+    }
+
+    // Sort columns left-to-right by average x position
+    std.mem.sort(ColumnAccum, columns.items, {}, struct {
+        fn lessThan(_: void, a: ColumnAccum, b: ColumnAccum) bool {
+            return a.avgX() < b.avgX();
+        }
+    }.lessThan);
+
+    // Build TextBlock output for each column
+    const blocks = try allocator.alloc(TextBlock, columns.items.len);
+    var blocks_built: usize = 0;
+    errdefer {
+        for (blocks[0..blocks_built]) |*block| {
+            block.deinit();
+        }
+        allocator.free(blocks);
+    }
+
+    for (columns.items) |col| {
+        const block_lines = try allocator.alloc(TextLine, col.line_indices.items.len);
+
+        for (col.line_indices.items, 0..) |line_idx, bi| {
+            block_lines[bi] = lines[line_idx];
+        }
+
+        // Sort lines within block top-to-bottom (should already be, but ensure)
+        std.mem.sort(TextLine, block_lines, {}, struct {
+            fn lessThan(_: void, a: TextLine, b: TextLine) bool {
+                return a.y_min < b.y_min;
+            }
+        }.lessThan);
+
+        // Compute block bounding box
+        var bb_x_min: u32 = std.math.maxInt(u32);
+        var bb_y_min: u32 = std.math.maxInt(u32);
+        var bb_x_max: u32 = 0;
+        var bb_y_max: u32 = 0;
+
+        for (block_lines) |*bl| {
+            const xr = lineXRange(bl);
+            if (xr.x_min < bb_x_min) bb_x_min = xr.x_min;
+            if (xr.x_max > bb_x_max) bb_x_max = xr.x_max;
+            if (bl.y_min < bb_y_min) bb_y_min = bl.y_min;
+            if (bl.y_max > bb_y_max) bb_y_max = bl.y_max;
+        }
+
+        blocks[blocks_built] = .{
+            .lines = block_lines,
+            .bbox = .{
+                .x = bb_x_min,
+                .y = bb_y_min,
+                .width = if (bb_x_max > bb_x_min) bb_x_max - bb_x_min else 0,
+                .height = if (bb_y_max > bb_y_min) bb_y_max - bb_y_min else 0,
+            },
+            .allocator = allocator,
+        };
+        blocks_built += 1;
+    }
+
+    // Free the original lines array (contents have been moved into blocks)
+    allocator.free(lines);
+
+    return blocks;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 test "single blob: 3x3 square in 5x5 image" {
@@ -1316,4 +1508,185 @@ test "segmentWords: three words via clear gap jumps" {
     try std.testing.expectEqual(@as(u32, 0), words[0].bbox.x);
     try std.testing.expectEqual(@as(u32, 76), words[1].bbox.x);
     try std.testing.expectEqual(@as(u32, 152), words[2].bbox.x);
+}
+
+// ── Column Detection Tests ──────────────────────────────────────────────────
+
+/// Helper: create a TextLine with allocated blobs for column detection tests.
+/// The blobs are allocated with the given allocator so TextBlock.deinit() can free them.
+fn makeTestTextLine(allocator: Allocator, blobs_data: []const Blob, y_min: u32, y_max: u32) !TextLine {
+    const blobs = try allocator.alloc(Blob, blobs_data.len);
+    @memcpy(blobs, blobs_data);
+    return .{
+        .blobs = blobs,
+        .y_min = y_min,
+        .y_max = y_max,
+        .baseline_slope = 0,
+        .baseline_intercept = @floatFromInt(y_max),
+        .allocator = allocator,
+    };
+}
+
+test "detectColumns: empty input → 0 blocks" {
+    const alloc = std.testing.allocator;
+
+    const lines = try alloc.alloc(TextLine, 0);
+    const blocks = try detectColumns(alloc, lines);
+    defer alloc.free(blocks);
+
+    try std.testing.expectEqual(@as(usize, 0), blocks.len);
+}
+
+test "detectColumns: single line → 1 block" {
+    const alloc = std.testing.allocator;
+
+    const blob_data = [_]Blob{
+        makeTextBlob(1, 10, 100, 50, 20),
+        makeTextBlob(2, 70, 100, 50, 20),
+    };
+
+    const lines = try alloc.alloc(TextLine, 1);
+    lines[0] = try makeTestTextLine(alloc, &blob_data, 100, 120);
+
+    const blocks = try detectColumns(alloc, lines);
+    defer {
+        for (blocks) |*b| {
+            var block = b;
+            block.deinit();
+        }
+        alloc.free(blocks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqual(@as(usize, 1), blocks[0].lines.len);
+}
+
+test "detectColumns: single column (3 lines with similar x-range)" {
+    const alloc = std.testing.allocator;
+
+    // 3 lines all spanning roughly x=10..120
+    const blob_data_1 = [_]Blob{
+        makeTextBlob(1, 10, 50, 50, 20),
+        makeTextBlob(2, 70, 50, 50, 20), // right = 120
+    };
+    const blob_data_2 = [_]Blob{
+        makeTextBlob(3, 15, 80, 45, 20),
+        makeTextBlob(4, 65, 80, 50, 20), // right = 115
+    };
+    const blob_data_3 = [_]Blob{
+        makeTextBlob(5, 12, 110, 48, 20),
+        makeTextBlob(6, 68, 110, 52, 20), // right = 120
+    };
+
+    const lines = try alloc.alloc(TextLine, 3);
+    lines[0] = try makeTestTextLine(alloc, &blob_data_1, 50, 70);
+    lines[1] = try makeTestTextLine(alloc, &blob_data_2, 80, 100);
+    lines[2] = try makeTestTextLine(alloc, &blob_data_3, 110, 130);
+
+    const blocks = try detectColumns(alloc, lines);
+    defer {
+        for (blocks) |*b| {
+            var block = b;
+            block.deinit();
+        }
+        alloc.free(blocks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqual(@as(usize, 3), blocks[0].lines.len);
+
+    // Lines should be sorted top-to-bottom
+    try std.testing.expect(blocks[0].lines[0].y_min <= blocks[0].lines[1].y_min);
+    try std.testing.expect(blocks[0].lines[1].y_min <= blocks[0].lines[2].y_min);
+}
+
+test "detectColumns: two columns (left and right halves)" {
+    const alloc = std.testing.allocator;
+
+    // Left column: x range ~10..100
+    const left_blob_1 = [_]Blob{
+        makeTextBlob(1, 10, 50, 40, 20),
+        makeTextBlob(2, 55, 50, 45, 20), // right = 100
+    };
+    const left_blob_2 = [_]Blob{
+        makeTextBlob(3, 12, 80, 38, 20),
+        makeTextBlob(4, 58, 80, 42, 20), // right = 100
+    };
+
+    // Right column: x range ~200..300
+    const right_blob_1 = [_]Blob{
+        makeTextBlob(5, 200, 50, 45, 20),
+        makeTextBlob(6, 255, 50, 45, 20), // right = 300
+    };
+    const right_blob_2 = [_]Blob{
+        makeTextBlob(7, 205, 80, 40, 20),
+        makeTextBlob(8, 260, 80, 40, 20), // right = 300
+    };
+
+    const lines = try alloc.alloc(TextLine, 4);
+    lines[0] = try makeTestTextLine(alloc, &left_blob_1, 50, 70);
+    lines[1] = try makeTestTextLine(alloc, &right_blob_1, 50, 70);
+    lines[2] = try makeTestTextLine(alloc, &left_blob_2, 80, 100);
+    lines[3] = try makeTestTextLine(alloc, &right_blob_2, 80, 100);
+
+    const blocks = try detectColumns(alloc, lines);
+    defer {
+        for (blocks) |*b| {
+            var block = b;
+            block.deinit();
+        }
+        alloc.free(blocks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+
+    // Blocks should be sorted left-to-right
+    try std.testing.expect(blocks[0].bbox.x < blocks[1].bbox.x);
+
+    // Left block
+    try std.testing.expectEqual(@as(usize, 2), blocks[0].lines.len);
+    try std.testing.expect(blocks[0].bbox.x <= 12);
+    try std.testing.expect(blocks[0].bbox.right() >= 100);
+
+    // Right block
+    try std.testing.expectEqual(@as(usize, 2), blocks[1].lines.len);
+    try std.testing.expect(blocks[1].bbox.x >= 200);
+    try std.testing.expect(blocks[1].bbox.right() >= 300);
+}
+
+test "detectColumns: mixed width lines that still overlap → 1 block" {
+    const alloc = std.testing.allocator;
+
+    // Line 1: x=10..200 (wide)
+    const blob_data_1 = [_]Blob{
+        makeTextBlob(1, 10, 50, 90, 20),
+        makeTextBlob(2, 110, 50, 90, 20), // right = 200
+    };
+    // Line 2: x=50..150 (narrower, but >50% overlap with line 1)
+    const blob_data_2 = [_]Blob{
+        makeTextBlob(3, 50, 80, 50, 20),
+        makeTextBlob(4, 105, 80, 45, 20), // right = 150
+    };
+    // Line 3: x=30..180 (medium width)
+    const blob_data_3 = [_]Blob{
+        makeTextBlob(5, 30, 110, 70, 20),
+        makeTextBlob(6, 110, 110, 70, 20), // right = 180
+    };
+
+    const lines = try alloc.alloc(TextLine, 3);
+    lines[0] = try makeTestTextLine(alloc, &blob_data_1, 50, 70);
+    lines[1] = try makeTestTextLine(alloc, &blob_data_2, 80, 100);
+    lines[2] = try makeTestTextLine(alloc, &blob_data_3, 110, 130);
+
+    const blocks = try detectColumns(alloc, lines);
+    defer {
+        for (blocks) |*b| {
+            var block = b;
+            block.deinit();
+        }
+        alloc.free(blocks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqual(@as(usize, 3), blocks[0].lines.len);
 }
