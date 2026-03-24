@@ -347,6 +347,210 @@ pub fn filterTextBlobs(allocator: Allocator, blobs: []const Blob) ![]Blob {
     return result;
 }
 
+// ── Text Line Detection ─────────────────────────────────────────────────────
+
+pub const TextLine = struct {
+    blobs: []Blob, // blobs in this line, sorted left-to-right
+    y_min: u32, // top of line
+    y_max: u32, // bottom of line
+    baseline_slope: f32, // slope of fitted baseline
+    baseline_intercept: f32, // intercept of fitted baseline
+    allocator: Allocator,
+
+    pub fn deinit(self: *TextLine) void {
+        self.allocator.free(self.blobs);
+        self.* = undefined;
+    }
+};
+
+/// Fit a baseline (y = slope * x + intercept) through blob bottom edges
+/// using linear least squares.
+fn fitBaseline(blobs: []const Blob) struct { slope: f32, intercept: f32 } {
+    if (blobs.len == 0) return .{ .slope = 0, .intercept = 0 };
+
+    if (blobs.len == 1) {
+        const bottom: f32 = @floatFromInt(blobs[0].component.bbox.bottom());
+        return .{ .slope = 0, .intercept = bottom };
+    }
+
+    const n: f32 = @floatFromInt(blobs.len);
+    var sum_x: f64 = 0;
+    var sum_y: f64 = 0;
+    var sum_xy: f64 = 0;
+    var sum_xx: f64 = 0;
+
+    for (blobs) |blob| {
+        const bbox = blob.component.bbox;
+        // x = horizontal center, y = bottom edge
+        const x: f64 = @as(f64, @floatFromInt(bbox.x)) + @as(f64, @floatFromInt(bbox.width)) / 2.0;
+        const y: f64 = @floatFromInt(bbox.bottom());
+
+        sum_x += x;
+        sum_y += y;
+        sum_xy += x * y;
+        sum_xx += x * x;
+    }
+
+    const nf: f64 = @floatCast(n);
+    const denom = nf * sum_xx - sum_x * sum_x;
+
+    if (@abs(denom) < 1e-9) {
+        // All blobs at same x: slope=0, intercept=mean(y)
+        return .{ .slope = 0, .intercept = @floatCast(sum_y / nf) };
+    }
+
+    const slope = (nf * sum_xy - sum_x * sum_y) / denom;
+    const intercept = (sum_y - slope * sum_x) / nf;
+
+    return .{ .slope = @floatCast(slope), .intercept = @floatCast(intercept) };
+}
+
+/// Temporary row accumulator used during line detection.
+const RowAccum = struct {
+    blob_indices: std.ArrayList(usize),
+    y_min: u32,
+    y_max: u32,
+
+    fn init(allocator: Allocator) RowAccum {
+        return .{
+            .blob_indices = std.ArrayList(usize).init(allocator),
+            .y_min = std.math.maxInt(u32),
+            .y_max = 0,
+        };
+    }
+
+    fn deinit(self: *RowAccum) void {
+        self.blob_indices.deinit();
+    }
+
+    /// Compute vertical overlap between this row and a blob's y-range.
+    fn verticalOverlap(self: RowAccum, blob_y: u32, blob_bottom: u32) u32 {
+        const overlap_top = @max(self.y_min, blob_y);
+        const overlap_bot = @min(self.y_max, blob_bottom);
+        if (overlap_bot > overlap_top) {
+            return overlap_bot - overlap_top;
+        }
+        return 0;
+    }
+};
+
+/// Group text blobs into lines by vertical proximity.
+/// Blobs should be pre-filtered to text type.
+/// Returns lines sorted top-to-bottom.
+pub fn detectTextLines(allocator: Allocator, blobs: []const Blob) ![]TextLine {
+    if (blobs.len == 0) return try allocator.alloc(TextLine, 0);
+
+    // Step 1: Sort blobs by y-center, then x for ties.
+    // We work on indices to avoid mutating the input.
+    const indices = try allocator.alloc(usize, blobs.len);
+    defer allocator.free(indices);
+    for (0..blobs.len) |i| {
+        indices[i] = i;
+    }
+
+    const SortCtx = struct {
+        blob_slice: []const Blob,
+
+        fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+            const ba = ctx.blob_slice[a].component.bbox;
+            const bb = ctx.blob_slice[b].component.bbox;
+            const ya_center = ba.y + ba.height / 2;
+            const yb_center = bb.y + bb.height / 2;
+            if (ya_center != yb_center) return ya_center < yb_center;
+            return ba.x < bb.x;
+        }
+    };
+
+    std.mem.sort(usize, indices, SortCtx{ .blob_slice = blobs }, SortCtx.lessThan);
+
+    // Step 2: Greedy row grouping by vertical overlap.
+    var rows = std.ArrayList(RowAccum).init(allocator);
+    defer {
+        for (rows.items) |*row| {
+            row.deinit();
+        }
+        rows.deinit();
+    }
+
+    for (indices) |blob_idx| {
+        const bbox = blobs[blob_idx].component.bbox;
+        const blob_y = bbox.y;
+        const blob_bottom = bbox.bottom();
+
+        // Find best overlapping row
+        var best_row: ?usize = null;
+        var best_overlap: u32 = 0;
+
+        for (rows.items, 0..) |row, ri| {
+            const overlap = row.verticalOverlap(blob_y, blob_bottom);
+            if (overlap > 0 and overlap > best_overlap) {
+                best_overlap = overlap;
+                best_row = ri;
+            }
+        }
+
+        if (best_row) |ri| {
+            // Add to existing row, update bounds
+            try rows.items[ri].blob_indices.append(blob_idx);
+            if (blob_y < rows.items[ri].y_min) rows.items[ri].y_min = blob_y;
+            if (blob_bottom > rows.items[ri].y_max) rows.items[ri].y_max = blob_bottom;
+        } else {
+            // Create new row
+            var new_row = RowAccum.init(allocator);
+            try new_row.blob_indices.append(blob_idx);
+            new_row.y_min = blob_y;
+            new_row.y_max = blob_bottom;
+            try rows.append(new_row);
+        }
+    }
+
+    // Step 3: Build TextLine output for each row.
+    const lines = try allocator.alloc(TextLine, rows.items.len);
+    errdefer {
+        for (lines) |*line| {
+            if (line.blobs.len > 0) line.deinit();
+        }
+        allocator.free(lines);
+    }
+
+    for (rows.items, 0..) |row, li| {
+        // Collect blobs for this row
+        const row_blobs = try allocator.alloc(Blob, row.blob_indices.items.len);
+
+        for (row.blob_indices.items, 0..) |blob_idx, bi| {
+            row_blobs[bi] = blobs[blob_idx];
+        }
+
+        // Sort blobs within row by x (left to right)
+        std.mem.sort(Blob, row_blobs, {}, struct {
+            fn lessThan(_: void, a: Blob, b: Blob) bool {
+                return a.component.bbox.x < b.component.bbox.x;
+            }
+        }.lessThan);
+
+        // Fit baseline
+        const baseline = fitBaseline(row_blobs);
+
+        lines[li] = .{
+            .blobs = row_blobs,
+            .y_min = row.y_min,
+            .y_max = row.y_max,
+            .baseline_slope = baseline.slope,
+            .baseline_intercept = baseline.intercept,
+            .allocator = allocator,
+        };
+    }
+
+    // Sort lines top-to-bottom by y_min
+    std.mem.sort(TextLine, lines, {}, struct {
+        fn lessThan(_: void, a: TextLine, b: TextLine) bool {
+            return a.y_min < b.y_min;
+        }
+    }.lessThan);
+
+    return lines;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 test "single blob: 3x3 square in 5x5 image" {
@@ -654,4 +858,150 @@ test "filterTextBlobs: returns only text blobs" {
     try std.testing.expectEqual(@as(usize, 2), text_blobs.len);
     try std.testing.expectEqual(@as(u32, 2), text_blobs[0].component.label);
     try std.testing.expectEqual(@as(u32, 3), text_blobs[1].component.label);
+}
+
+// ── Text Line Detection Tests ───────────────────────────────────────────────
+
+fn makeTextBlob(label: u32, x: u32, y: u32, width: u32, height: u32) Blob {
+    return .{
+        .component = .{
+            .label = label,
+            .bbox = .{ .x = x, .y = y, .width = width, .height = height },
+            .pixel_count = width * height,
+        },
+        .blob_type = .text,
+    };
+}
+
+test "detectTextLines: single line of 5 blobs" {
+    const alloc = std.testing.allocator;
+
+    // 5 blobs at roughly the same y, spread horizontally
+    const blobs = [_]Blob{
+        makeTextBlob(1, 10, 100, 12, 20),
+        makeTextBlob(2, 30, 102, 12, 20),
+        makeTextBlob(3, 50, 98, 12, 20),
+        makeTextBlob(4, 70, 101, 12, 20),
+        makeTextBlob(5, 90, 99, 12, 20),
+    };
+
+    const lines = try detectTextLines(alloc, &blobs);
+    defer {
+        for (lines) |*line| {
+            var l = line;
+            l.deinit();
+        }
+        alloc.free(lines);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), lines.len);
+    try std.testing.expectEqual(@as(usize, 5), lines[0].blobs.len);
+
+    // Blobs should be sorted by x within the line
+    for (1..lines[0].blobs.len) |i| {
+        try std.testing.expect(lines[0].blobs[i].component.bbox.x > lines[0].blobs[i - 1].component.bbox.x);
+    }
+
+    // Slope should be near zero for a horizontal line
+    try std.testing.expect(@abs(lines[0].baseline_slope) < 0.1);
+}
+
+test "detectTextLines: two separate lines" {
+    const alloc = std.testing.allocator;
+
+    // Line 1: y around 50
+    // Line 2: y around 200 (well separated)
+    const blobs = [_]Blob{
+        makeTextBlob(1, 10, 50, 12, 20),
+        makeTextBlob(2, 30, 52, 12, 20),
+        makeTextBlob(3, 50, 48, 12, 20),
+        makeTextBlob(4, 10, 200, 12, 20),
+        makeTextBlob(5, 30, 202, 12, 20),
+        makeTextBlob(6, 50, 198, 12, 20),
+    };
+
+    const lines = try detectTextLines(alloc, &blobs);
+    defer {
+        for (lines) |*line| {
+            var l = line;
+            l.deinit();
+        }
+        alloc.free(lines);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+
+    // Lines should be sorted top-to-bottom
+    try std.testing.expect(lines[0].y_min < lines[1].y_min);
+
+    // First line should have blobs around y=50
+    try std.testing.expectEqual(@as(usize, 3), lines[0].blobs.len);
+    try std.testing.expect(lines[0].y_min < 55);
+
+    // Second line should have blobs around y=200
+    try std.testing.expectEqual(@as(usize, 3), lines[1].blobs.len);
+    try std.testing.expect(lines[1].y_min > 150);
+}
+
+test "detectTextLines: slightly sloped line" {
+    const alloc = std.testing.allocator;
+
+    // Blobs with a gradual y increase (slope ~ 0.5 px per px)
+    // Each blob is 20px apart in x, and y increases by 10 each time
+    const blobs = [_]Blob{
+        makeTextBlob(1, 10, 100, 12, 20),
+        makeTextBlob(2, 30, 110, 12, 20),
+        makeTextBlob(3, 50, 120, 12, 20),
+        makeTextBlob(4, 70, 130, 12, 20),
+    };
+
+    const lines = try detectTextLines(alloc, &blobs);
+    defer {
+        for (lines) |*line| {
+            var l = line;
+            l.deinit();
+        }
+        alloc.free(lines);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), lines.len);
+    try std.testing.expectEqual(@as(usize, 4), lines[0].blobs.len);
+
+    // Slope should be positive (y increases left to right)
+    try std.testing.expect(lines[0].baseline_slope > 0.0);
+    // Slope should be around 0.5 (10px rise over 20px run)
+    try std.testing.expect(lines[0].baseline_slope > 0.3);
+    try std.testing.expect(lines[0].baseline_slope < 0.7);
+}
+
+test "detectTextLines: single blob" {
+    const alloc = std.testing.allocator;
+
+    const blobs = [_]Blob{
+        makeTextBlob(1, 50, 100, 12, 20),
+    };
+
+    const lines = try detectTextLines(alloc, &blobs);
+    defer {
+        for (lines) |*line| {
+            var l = line;
+            l.deinit();
+        }
+        alloc.free(lines);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), lines.len);
+    try std.testing.expectEqual(@as(usize, 1), lines[0].blobs.len);
+    try std.testing.expectEqual(@as(f32, 0), lines[0].baseline_slope);
+    // Intercept should be the blob bottom (100 + 20 = 120)
+    try std.testing.expectEqual(@as(f32, 120.0), lines[0].baseline_intercept);
+}
+
+test "detectTextLines: empty input" {
+    const alloc = std.testing.allocator;
+
+    const lines = try detectTextLines(alloc, &[_]Blob{});
+    defer alloc.free(lines);
+
+    try std.testing.expectEqual(@as(usize, 0), lines.len);
 }
