@@ -11,6 +11,9 @@ pub const recognizer = @import("recognizer.zig");
 pub const image = @import("image.zig");
 pub const layout = @import("layout.zig");
 pub const types = @import("types.zig");
+pub const text = @import("text.zig");
+pub const hocr = @import("hocr.zig");
+pub const json_renderer = @import("json_renderer.zig");
 
 /// Load an image from a file path. Returns pixel data and image dimensions.
 /// Caller owns the returned pixel slice and must free it with `stbiFree`.
@@ -49,4 +52,7 @@ test {
     _ = image;
     _ = layout;
     _ = types;
+    _ = text;
+    _ = hocr;
+    _ = json_renderer;
 }
