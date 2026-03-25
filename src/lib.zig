@@ -1,8 +1,12 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const c = @cImport({
+
+const is_wasm = builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64;
+
+const c = if (!is_wasm) @cImport({
     @cInclude("stb_image.h");
-});
+}) else struct {};
 
 pub const activations = @import("activations.zig");
 pub const weights = @import("weights.zig");
@@ -16,9 +20,9 @@ pub const text = @import("text.zig");
 pub const hocr = @import("hocr.zig");
 pub const json_renderer = @import("json_renderer.zig");
 
-/// Load an image from a file path. Returns pixel data and image dimensions.
-/// Caller owns the returned pixel slice and must free it with `stbiFree`.
+/// Load an image from a file path (native only, not available on WASM).
 pub fn loadImage(path: [*:0]const u8) !struct { data: [*]u8, width: c_int, height: c_int, channels: c_int } {
+    if (is_wasm) @compileError("loadImage not available on WASM");
     var width: c_int = 0;
     var height: c_int = 0;
     var channels: c_int = 0;
@@ -31,6 +35,7 @@ pub fn loadImage(path: [*:0]const u8) !struct { data: [*]u8, width: c_int, heigh
 
 /// Free pixel data previously returned by `loadImage`.
 pub fn stbiFree(data: [*]u8) void {
+    if (is_wasm) @compileError("stbiFree not available on WASM");
     c.stbi_image_free(data);
 }
 
@@ -360,9 +365,6 @@ fn splitBySpaces(allocator: Allocator, input: []const u8) ![][]u8 {
 }
 
 // ── C-ABI / WASM Exports ──────────────────────────────────────────────────────
-
-const is_wasm = @import("builtin").target.cpu.arch == .wasm32 or
-    @import("builtin").target.cpu.arch == .wasm64;
 
 /// Allocator used by C-ABI exports. On WASM, use page_allocator; on native, use c_allocator.
 const export_allocator: Allocator = if (is_wasm) std.heap.page_allocator else std.heap.c_allocator;
