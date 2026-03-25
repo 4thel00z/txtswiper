@@ -50,6 +50,21 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the txtswiper executable");
     run_step.dependOn(&run_cmd.step);
 
+    // ── WASM target ─────────────────────────────────────────────────
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+    });
+    const wasm = b.addStaticLibrary(.{
+        .name = "txtswiper",
+        .root_source_file = b.path("src/lib.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    // No stb_image or libc for WASM — image loading is via raw pixels.
+    const wasm_step = b.step("wasm", "Build WASM library");
+    wasm_step.dependOn(&wasm.step);
+
     // ── Tests ───────────────────────────────────────────────────────
     const lib_tests = b.addTest(.{
         .root_source_file = b.path("src/lib.zig"),

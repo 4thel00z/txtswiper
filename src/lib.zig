@@ -359,6 +359,123 @@ fn splitBySpaces(allocator: Allocator, input: []const u8) ![][]u8 {
     return parts.toOwnedSlice();
 }
 
+// ── C-ABI / WASM Exports ──────────────────────────────────────────────────────
+
+const is_wasm = @import("builtin").target.cpu.arch == .wasm32 or
+    @import("builtin").target.cpu.arch == .wasm64;
+
+/// Allocator used by C-ABI exports. On WASM, use page_allocator; on native, use c_allocator.
+const export_allocator: Allocator = if (is_wasm) std.heap.page_allocator else std.heap.c_allocator;
+
+/// Opaque handle for C-ABI consumers.
+const ExportEngine = opaque {};
+const ExportResult = opaque {};
+
+fn toEngine(ptr: *ExportEngine) *OcrEngine {
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn toResult(ptr: *ExportResult) *types.PageResult {
+    return @ptrCast(@alignCast(ptr));
+}
+
+/// Initialize an OCR engine from .traineddata model bytes.
+/// Returns null on failure.
+export fn txtswiper_init(model_data: [*]const u8, model_len: usize) ?*ExportEngine {
+    const alloc = export_allocator;
+    const engine = alloc.create(OcrEngine) catch return null;
+    engine.* = OcrEngine.init(alloc, model_data[0..model_len]) catch {
+        alloc.destroy(engine);
+        return null;
+    };
+    return @ptrCast(engine);
+}
+
+/// Set the image from raw pixel data (grayscale or RGB/RGBA).
+/// Returns 0 on success, -1 on failure.
+export fn txtswiper_set_image(handle: *ExportEngine, data: [*]const u8, w: u32, h: u32, ch: u32) i32 {
+    const engine = toEngine(handle);
+    const len = @as(usize, w) * @as(usize, h) * @as(usize, ch);
+    engine.setImageRaw(data[0..len], w, h, ch) catch return -1;
+    return 0;
+}
+
+/// Run OCR recognition. Returns null on failure.
+/// Caller must free with txtswiper_free_result.
+export fn txtswiper_recognize(handle: *ExportEngine) ?*ExportResult {
+    const engine = toEngine(handle);
+    const alloc = engine.allocator;
+    const result = alloc.create(types.PageResult) catch return null;
+    result.* = engine.recognize() catch {
+        alloc.destroy(result);
+        return null;
+    };
+    return @ptrCast(result);
+}
+
+/// Get recognized text as UTF-8. Writes into out_buf, returns number of bytes written.
+/// If buf_len is 0, returns the required buffer size.
+export fn txtswiper_get_text(result_handle: *ExportResult, out_buf: ?[*]u8, buf_len: usize) usize {
+    const result = toResult(result_handle);
+    const alloc = export_allocator;
+    const rendered = text.renderText(alloc, result) catch return 0;
+    defer alloc.free(rendered);
+
+    if (buf_len == 0 or out_buf == null) return rendered.len;
+
+    const copy_len = @min(rendered.len, buf_len);
+    if (out_buf) |buf| {
+        @memcpy(buf[0..copy_len], rendered[0..copy_len]);
+    }
+    return copy_len;
+}
+
+/// Get hOCR output. Same semantics as txtswiper_get_text.
+export fn txtswiper_get_hocr(result_handle: *ExportResult, out_buf: ?[*]u8, buf_len: usize) usize {
+    const result = toResult(result_handle);
+    const alloc = export_allocator;
+    const rendered = hocr.renderHocr(alloc, result) catch return 0;
+    defer alloc.free(rendered);
+
+    if (buf_len == 0 or out_buf == null) return rendered.len;
+
+    const copy_len = @min(rendered.len, buf_len);
+    if (out_buf) |buf| {
+        @memcpy(buf[0..copy_len], rendered[0..copy_len]);
+    }
+    return copy_len;
+}
+
+/// Get JSON output. Same semantics as txtswiper_get_text.
+export fn txtswiper_get_json(result_handle: *ExportResult, out_buf: ?[*]u8, buf_len: usize) usize {
+    const result = toResult(result_handle);
+    const alloc = export_allocator;
+    const rendered = json_renderer.renderJson(alloc, result) catch return 0;
+    defer alloc.free(rendered);
+
+    if (buf_len == 0 or out_buf == null) return rendered.len;
+
+    const copy_len = @min(rendered.len, buf_len);
+    if (out_buf) |buf| {
+        @memcpy(buf[0..copy_len], rendered[0..copy_len]);
+    }
+    return copy_len;
+}
+
+/// Free a PageResult returned by txtswiper_recognize.
+export fn txtswiper_free_result(result_handle: *ExportResult) void {
+    const result = toResult(result_handle);
+    result.deinit();
+    export_allocator.destroy(result);
+}
+
+/// Free the OCR engine.
+export fn txtswiper_free(handle: *ExportEngine) void {
+    const engine = toEngine(handle);
+    engine.deinit();
+    export_allocator.destroy(engine);
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 test "stb_image linked" {
